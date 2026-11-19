@@ -213,7 +213,14 @@ class App:
         try:
             self.ser = serial.Serial(dev, BAUD, timeout=0.2, write_timeout=15)
         except Exception as e:
-            self._say(str(e), "err")
+            # A serial port takes a single reader, and "Access is denied" says
+            # nothing about who has it. Name the usual suspects instead.
+            if isinstance(e, PermissionError) or "ermission" in str(e)                     or "ccesso negato" in str(e):
+                self._say(f"{dev} is held by another process. Close a running "
+                          f"tunnel (socks_tunnel.py / tcp_proxy.py), another "
+                          f"copy of this GUI, or a serial terminal.", "err")
+            else:
+                self._say(str(e), "err")
             return
         self._stop.clear()
         threading.Thread(target=self._reader, daemon=True).start()
