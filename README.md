@@ -623,6 +623,12 @@ Each of these failed silently, so they are worth knowing if you change this:
   backend.
 - Give the host's first write to a freshly opened gadget port a generous
   `write_timeout`. 4s was not enough; a short one looks exactly like a dead Pi.
+- A mode that owns the serial link must be able to tell that the other end is
+  gone. Killing the PC side of the tunnel without sending QUIT left the Pi
+  reading frames and silently ignoring line commands, so the GUI just sat on
+  "starting bridge...". The tunnel now watches the bytes it discards while
+  resyncing: a newline means someone is talking the line protocol, so it hands
+  the port back. The idle timeout is 180s as a second net.
 - `dnsmasq --tag-if=civswitch` is invalid (`--tag-if` takes a full tag
   expression), so dnsmasq exited at startup and clients associated but got no
   DHCP lease.

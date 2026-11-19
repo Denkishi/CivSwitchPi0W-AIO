@@ -32,7 +32,7 @@ CLOSE = 5
 QUIT = 6        # the PC is done; leave tunnel mode
 PING = 7
 
-IDLE_EXIT = 900  # seconds without a frame before giving the port back
+IDLE_EXIT = 180  # seconds without a frame before giving the port back
 
 
 def frame(kind, channel, payload=b""):
@@ -45,12 +45,20 @@ class FrameReader:
     def __init__(self, read):
         self._read = read
         self._buf = b""
+        # Bytes dropped while resyncing. If they spell a text line, a human or
+        # the GUI is talking the line protocol at us -- which means the PC
+        # side of the tunnel is gone and we should hand the port back rather
+        # than sit here ignoring commands until the idle timeout.
+        self.junk = b""
 
     def next_frame(self, deadline_check):
         while True:
             # Resync: drop anything before the magic.
             while self._buf and self._buf[0] != MAGIC:
+                self.junk += self._buf[:1]
                 self._buf = self._buf[1:]
+            if bytes([10]) in self.junk:
+                return "text"
             if len(self._buf) >= HEADER:
                 _, kind, chan, length = struct.unpack(">BBHH", self._buf[:HEADER])
                 if len(self._buf) >= HEADER + length:
@@ -147,6 +155,9 @@ class Tunnel:
             got = reader.next_frame(idle)
             if got is None:
                 self.log("tunnel idle, leaving tunnel mode")
+                break
+            if got == "text":
+                self.log("tunnel saw a line command; handing the port back")
                 break
             kind, chan, payload = got
             last = time.monotonic()
