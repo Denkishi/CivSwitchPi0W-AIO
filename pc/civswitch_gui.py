@@ -162,6 +162,14 @@ class App:
             b.pack(side=tk.LEFT, padx=(0, 4))
             self.ftp_buttons.append(b)
 
+        prow = ttk.Frame(fbox)
+        prow.pack(fill=tk.X, pady=(6, 0))
+        self.prog = ttk.Progressbar(prow, mode="determinate", maximum=1000)
+        self.prog.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.prog_lbl = ttk.Label(prow, text="", width=34, anchor=tk.W,
+                                  foreground="#555")
+        self.prog_lbl.pack(side=tk.LEFT, padx=(6, 0))
+
         cmd = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
         cmd.pack(fill=tk.X)
         ttk.Label(cmd, text="❯").pack(side=tk.LEFT)
@@ -510,6 +518,48 @@ class App:
                     pass
         threading.Thread(target=work, daemon=True).start()
 
+    def _progress_start(self, what, total):
+        self._prog_total = total
+        self._prog_last = 0.0
+        self._prog_t0 = time.monotonic()
+        self.prog.config(mode="determinate" if total else "indeterminate")
+        self.prog["value"] = 0
+        self.prog_lbl.config(text=f"{what}…")
+        if not total:
+            self.prog.start(80)
+
+    def _progress_tick(self, done):
+        """Called from the worker thread; throttled so the UI stays alive."""
+        now = time.monotonic()
+        if now - self._prog_last < 0.15 and done != self._prog_total:
+            return
+        self._prog_last = now
+        rate = done / max(now - self._prog_t0, 0.001)
+        try:
+            self.root.after(0, self._progress_show, done, rate)
+        except RuntimeError:
+            pass
+
+    def _progress_show(self, done, rate):
+        total = self._prog_total
+        speed = f"{rate / 1024:,.0f} KB/s"
+        if total:
+            self.prog["value"] = min(1000, int(done * 1000 / total))
+            pct = done * 100 // total
+            self.prog_lbl.config(
+                text=f"{pct}%  {done:,} / {total:,} B  ·  {speed}")
+        else:
+            self.prog_lbl.config(text=f"{done:,} B  ·  {speed}")
+
+    def _progress_end(self, note=""):
+        try:
+            self.prog.stop()
+        except Exception:
+            pass
+        self.prog.config(mode="determinate")
+        self.prog["value"] = 1000 if note else 0
+        self.prog_lbl.config(text=note)
+
     def _ftp_busy(self, busy):
         state = tk.DISABLED if busy else tk.NORMAL
         for b in self.ftp_buttons:
@@ -585,11 +635,17 @@ class App:
             return
         remote = self._join(name)
         self._say(f"downloading {remote} ({size:,} B)", "dim")
+        self._progress_start(f"Downloading {name}", size)
         self._ftp_task(self._do_download, remote, local)
 
     def _do_download(self, remote, local):
-        with open(local, "wb") as fh:
-            n = self.ftp.retrieve(remote, fh)
+        try:
+            with open(local, "wb") as fh:
+                n = self.ftp.retrieve(remote, fh, progress=self._progress_tick)
+        except Exception:
+            self.root.after(0, self._progress_end, "failed")
+            raise
+        self.root.after(0, self._progress_end, f"done · {n:,} B")
         self.root.after(0, self._say, f"saved {n:,} B to {local}", "dim")
 
     def _ftp_upload(self):
@@ -597,12 +653,22 @@ class App:
         if not local:
             return
         remote = self._join(os.path.basename(local))
-        self._say(f"uploading {local} -> {remote}", "dim")
+        try:
+            total = os.path.getsize(local)
+        except OSError:
+            total = 0
+        self._say(f"uploading {local} -> {remote} ({total:,} B)", "dim")
+        self._progress_start(f"Uploading {os.path.basename(local)}", total)
         self._ftp_task(self._do_upload, local, remote)
 
     def _do_upload(self, local, remote):
-        with open(local, "rb") as fh:
-            n = self.ftp.store(fh, remote)
+        try:
+            with open(local, "rb") as fh:
+                n = self.ftp.store(fh, remote, progress=self._progress_tick)
+        except Exception:
+            self.root.after(0, self._progress_end, "failed")
+            raise
+        self.root.after(0, self._progress_end, f"done · {n:,} B")
         self.root.after(0, self._say, f"sent {n:,} B", "dim")
         self.root.after(0, self._ftp_refresh)
 

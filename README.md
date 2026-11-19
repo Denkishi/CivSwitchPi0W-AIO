@@ -510,6 +510,8 @@ pi/
 Pi Zero W, Raspberry Pi OS Lite Trixie, kernel `6.18.50+rpt-rpi-v6`,
 Python 3.13, driven from Windows 11.
 
+- An 11.8 MB file came off the console's SD card through the tunnel at about
+  2.1 MB/s, byte-for-byte intact, with the progress bar tracking it.
 - Supervisor starts at boot and opens `/dev/ttyGS0`.
 - The Pi enumerates as a serial device, USB VID/PID `0525:A4A7`.
 - `INFO`, `STATUS`, `SCAN`, `RELAY` answer and terminate with `END`.
