@@ -342,8 +342,8 @@ python pc/tcp_proxy.py --console 192.168.4.2
 
 This works because those tools use one connection per request -- send
 everything, half-close, read until the console closes -- which maps exactly
-onto the supervisor's `RELAY` command. Expect the serial link to be the limit
-for large payloads.
+onto the supervisor's `RELAY` command. The serial link is not the bottleneck
+it looks like: see the measured rate under Browsing the console filesystem.
 
 ### 4.2 By moving the PC onto the AP
 
