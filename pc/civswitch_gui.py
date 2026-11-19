@@ -56,6 +56,11 @@ class App:
         self.ports = []
         self.proxy = None          # Popen while a tunnel owns the COM port
         self.ftp = None
+        # One control connection, so one operation at a time. Letting two
+        # buttons overlap desynced it: the second command landed mid-transfer
+        # and the server answered "503 Invalid command during transfer", then
+        # reset the connection, which left Up and Refresh dead.
+        self.ftp_lock = threading.Lock()
         self.cwd = "/"
         self.entries = []
         self._stop = threading.Event()
@@ -484,13 +489,42 @@ class App:
         self.path_lbl.config(text="")
 
     def _ftp_task(self, fn, *args):
-        """Run an FTP call off the UI thread; the link is slow."""
+        """Run one FTP call off the UI thread; the link is slow."""
+        if not self.ftp:
+            return
+        if not self.ftp_lock.acquire(blocking=False):
+            self._say("FTP busy -- wait for the current operation.", "dim")
+            return
+        self._ftp_busy(True)
+
         def work():
             try:
                 fn(*args)
             except Exception as e:
-                self.root.after(0, self._say, f"FTP: {e}", "err")
+                self.root.after(0, self._ftp_error, e)
+            finally:
+                self.ftp_lock.release()
+                try:
+                    self.root.after(0, self._ftp_busy, False)
+                except RuntimeError:
+                    pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _ftp_busy(self, busy):
+        state = tk.DISABLED if busy else tk.NORMAL
+        for b in self.ftp_buttons:
+            b.config(state=state)
+
+    def _ftp_error(self, exc):
+        self._say(f"FTP: {exc}", "err")
+        text = str(exc)
+        # A reset or a desynced control connection cannot be recovered by
+        # retrying: drop the session so the next click reconnects cleanly
+        # instead of failing in the same way forever.
+        fatal = isinstance(exc, (OSError, ConnectionError)) or             text.startswith("503") or "closed" in text or "timed out" in text
+        if fatal:
+            self._say("FTP session dropped; click Connect again.", "dim")
+            self._ftp_disconnect()
 
     def _ftp_refresh(self):
         if not self.ftp:
@@ -498,8 +532,12 @@ class App:
         self._ftp_task(self._do_refresh)
 
     def _do_refresh(self):
-        # The server rejects LIST with a path, so navigate then list.
-        entries = self.ftp.listdir(self.cwd if self.cwd != "/" else None)
+        # Always CWD to where we think we are, then list with a bare LIST
+        # (the server rejects LIST with a path). Passing None listed the
+        # server's current directory instead, so Up changed the label and
+        # showed the same contents.
+        self.ftp.cwd(self.cwd)
+        entries = self.ftp.listdir()
         entries.sort(key=lambda e: (not e[1], e[0].lower()))
         self.root.after(0, self._show_entries, entries)
 

@@ -399,6 +399,16 @@ tunnel rewrites a loopback target back to the console. And if the client is in
 **active** mode it asks the proxy to dial a port on the PC, which nothing on
 the console side can reach; the log says so explicitly when it happens.
 
+One control connection means one operation at a time. Letting two buttons
+overlap desyncs it: the second command lands mid-transfer, the server answers
+`503 Invalid command during transfer` and then resets, which leaves the panel
+dead until you reconnect. The GUI serializes operations, disables the buttons
+while one runs, and drops the session on an unrecoverable error so the next
+click reconnects cleanly.
+
+Listing also has to CWD explicitly every time. Relying on the server's current
+directory made **Up** change the path label while showing the same contents.
+
 Homebrew FTP servers can also be fragile under rapid reconnection: this one
 answers `550 unavailable` for a while after a few aborted sessions. Keeping
 one session open, as the GUI does, avoids it.
