@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+# Never commit console keys or payloads: this repo carries neither.
+prod.keys
+*.uf2
+*.img
