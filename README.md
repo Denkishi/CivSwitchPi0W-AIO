@@ -374,8 +374,13 @@ can browse its SD card directly -- no FileZilla, no proxy settings.
    **Connect**.
 
 Then double-click to enter directories or download, and use **Up**,
-**Refresh**, **Download**, **Upload** and **Delete**. Transfers cross the USB
-serial link at about 2.1 MB/s measured, so large files are practical.
+**Refresh**, **Download**, **Upload** and **Delete**. A progress bar shows
+bytes, percentage and rate, so a slow transfer is distinguishable from a
+stalled one.
+
+Throughput is better than the nominal 115200 baud suggests, because a USB CDC
+gadget ignores that figure and runs at USB speed. Measured here at about
+**2.1 MB/s** pulling an 11.8 MB file off the console, byte-for-byte intact.
 
 `pc/ftp_client.py` also works on its own, with the SOCKS tunnel running:
 
