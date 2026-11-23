@@ -290,6 +290,9 @@ With **Stop bridge on exit** ticked (the default), closing the GUI also stops
 the bridge and shuts down any tunnel it started, so nothing is left holding
 the COM port. The Pi still autostarts the bridge on its next boot.
 
+The GUI reconnects on its own when the Pi is unplugged and plugged back in,
+and the 🌙 / ☀ button in the top bar switches between light and dark.
+
 The command box at the bottom sends raw protocol commands (`INFO`, `STATUS`,
 `SCAN`, `BRIDGE`, `STOP`) and prints the reply, which is useful when you want
 to ask the Pi directly what it is doing.
@@ -390,8 +393,15 @@ It works like a desktop file manager:
   server allows it, otherwise they go through the PC;
 - inline rename (F2), new folder, recursive download / upload / delete, a
   right-click menu, and "Open on this PC";
+- a **preview pane** for text and config files (editable in place -- Save
+  writes it straight back to the console) and for images;
+- **Tools**: search the whole SD by name (results stream in), a disk-usage
+  breakdown of any folder with bars, and **bookmarks** for folders you open a
+  lot;
 - a transfer queue with percentage, rate, time left and **Cancel**. Transfers
-  use their own FTP connection, so browsing keeps working meanwhile.
+  use their own FTP connection, so browsing keeps working meanwhile, resume
+  where they left off (`REST`), and raise a desktop notification when they
+  finish while the window is in the background.
 
 Throughput is better than the nominal 115200 baud suggests, because a USB CDC
 gadget ignores that figure and runs at USB speed. Measured here at about
@@ -509,6 +519,7 @@ corrupts it. `RELAY` is what the proxy uses.
 pc/
   civswitch_gui.py     PC GUI: bridge, payloads, commands, tunnel, Files tab
   ftp_browser.py       the Files tab: two-pane FTP file manager
+  gui_extras.py        light/dark theme, toasts, taskbar flash
   ftp_client.py        minimal FTP over SOCKS, also usable standalone
   pilink.py            clean shutdown helpers shared by the GUI and tunnels
   win_drop.py          drag and drop from Explorer, high-DPI support

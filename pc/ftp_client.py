@@ -279,13 +279,52 @@ class Ftp:
         self._buf = b""
         self.connect()
 
-    def retrieve(self, remote, fileobj, progress=None, size=None):
-        """Download; with size given, stop as soon as that many bytes arrived."""
+    def size(self, remote):
+        """Remote file size via SIZE, or None if the server will not say.
+
+        Needs binary mode (set in connect()). Some servers answer 550 for a
+        directory or when SIZE is unsupported; the caller treats None as
+        "unknown" rather than failing.
+        """
+        name = self._split(remote)
+        try:
+            line = self._cmd(f"SIZE {name}", 213)
+        except FtpError:
+            return None
+        try:
+            return int(line[3:].strip())
+        except ValueError:
+            return None
+
+    def _rest(self, offset):
+        """Ask to resume at offset. Returns True if the server agreed."""
+        if not offset:
+            return False
+        try:
+            self._cmd(f"REST {offset}", (350, 350))
+            return True
+        except FtpError:
+            return False
+
+    def retrieve(self, remote, fileobj, progress=None, size=None, offset=0):
+        """Download remote into fileobj.
+
+        With size given, stop as soon as that many bytes arrived (so a stalled
+        tail does not hang). With offset given and the server supporting REST,
+        resume there -- fileobj must already hold the first offset bytes and be
+        positioned at the end.
+        """
         remote = self._split(remote)
+        resumed = self._rest(offset) if offset else False
+        base = offset if resumed else 0
+        if offset and not resumed:
+            # No resume: start over from the top.
+            fileobj.seek(0)
+            fileobj.truncate()
         data = self._pasv()
         self._send(f"RETR {remote}")
         self._expect((125, 150))
-        total = 0
+        total = base
         try:
             while not (size and total >= size):
                 chunk = data.recv(65536)
@@ -300,12 +339,21 @@ class Ftp:
         self.confirmed = self._finish_transfer(self.RETR_WAIT)
         return total
 
-    def store(self, local_fileobj, remote, progress=None):
+    def store(self, local_fileobj, remote, progress=None, offset=0):
+        """Upload local_fileobj to remote.
+
+        With offset given and the server supporting REST, resume there --
+        local_fileobj is seeked to offset first.
+        """
         remote = self._split(remote)
+        resumed = self._rest(offset) if offset else False
+        base = offset if resumed else 0
+        if offset:
+            local_fileobj.seek(base)
         data = self._pasv()
         self._send(f"STOR {remote}")
         self._expect((125, 150))
-        total = 0
+        total = base
         try:
             while True:
                 chunk = local_fileobj.read(32768)

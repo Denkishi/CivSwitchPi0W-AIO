@@ -31,6 +31,7 @@ import serial
 import serial.tools.list_ports
 
 import ftp_browser
+import gui_extras
 import pilink
 import win_drop
 
@@ -48,6 +49,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TCP_PROXY = os.path.join(HERE, "tcp_proxy.py")
 SOCKS_TUNNEL = os.path.join(HERE, "socks_tunnel.py")
 LOG_FILE = os.path.join(HERE, "civswitch_gui.log")
+PREFS_FILE = os.path.join(HERE, "civswitch_prefs.json")
+
+
+def _load_pref(key, default):
+    try:
+        with open(PREFS_FILE, encoding="utf-8") as fh:
+            return json.load(fh).get(key, default)
+    except Exception:
+        return default
+
+
+def _save_pref(key, value):
+    try:
+        data = {}
+        try:
+            with open(PREFS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            pass
+        data[key] = value
+        with open(PREFS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
 
 # Both tunnels need the COM port to themselves, so only one runs at a time.
 TUNNELS = {
@@ -219,16 +244,22 @@ class App:
         self.proxy_socks = False    # the running tunnel is the SOCKS one
         self.socks_ready = False    # ...and it is accepting connections
         self._closing = False
+        self._last_devices = set()  # COM devices seen, for auto-reconnect
+        self.auto_serial = True     # reconnect when the Pi is replugged
 
-        ttk.Style().theme_use("clam")
+        self.dark = tk.BooleanVar(value=_load_pref("dark", False))
+        self.colors = gui_extras.apply_theme(root, self.dark.get())
         self._build()
         root.report_callback_exception = self._tk_error
+        self._apply_theme()
         self._drain()
         self._scan_ports()
+        self._last_devices = {p.device for p in self.ports}
         # Files dragged in from Explorer. The window procedure only queues
         # them; the main loop handles them.
         win_drop.enable(root, lambda paths, pt: self._ui(self._on_os_drop,
                                                         paths, pt))
+        self.root.after(1500, self._watch_ports)
 
     # -- thread hand-off ------------------------------------------
     def _ui(self, fn, *args):
@@ -281,6 +312,9 @@ class App:
         self.state_lbl = ttk.Label(bar, text="● not connected",
                                    foreground="#b33")
         self.state_lbl.pack(side=tk.RIGHT)
+        self.theme_btn = ttk.Button(bar, text="🌙" if not self.dark.get() else "☀",
+                                    width=3, command=self._toggle_theme)
+        self.theme_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         bridge = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
         bridge.pack(fill=tk.X)
@@ -369,12 +403,21 @@ class App:
     def _scan_ports(self):
         self.ports = sorted(serial.tools.list_ports.comports(),
                             key=lambda p: p.device)
+        self._fill_ports()
+
+    def _fill_ports(self, keep=None):
+        """Refresh the combobox from self.ports, keeping `keep` selected."""
         self.port_box["values"] = [
             p.device + ("  (Pi)" if (p.vid, p.pid) == GADGET else "")
             for p in self.ports
         ]
         if not self.ports:
             return
+        if keep:
+            for i, p in enumerate(self.ports):
+                if p.device == keep:
+                    self.port_box.current(i)
+                    return
         # Pick the Pi by numeric VID/PID; on Windows its description is just
         # a generic "USB Serial Device".
         for i, p in enumerate(self.ports):
@@ -838,6 +881,74 @@ class App:
 
     def _status(self, text, color):
         self.state_lbl.config(text=f"● {text}", foreground=color)
+
+    # -- theme ----------------------------------------------------
+    def _toggle_theme(self):
+        self.dark.set(not self.dark.get())
+        _save_pref("dark", self.dark.get())
+        self.colors = gui_extras.apply_theme(self.root, self.dark.get())
+        self.theme_btn.config(text="☀" if self.dark.get() else "🌙")
+        self._apply_theme()
+
+    def _apply_theme(self):
+        c = self.colors
+        self.log.config(background=c["log_bg"], foreground=c["text"],
+                        insertbackground=c["text"])
+        self.log.tag_configure("err", foreground=c["err"])
+        self.log.tag_configure("dim", foreground=c["dim"])
+        self.log.tag_configure("me", foreground=c["me"])
+        if hasattr(self, "browser"):
+            self.browser.apply_colors(c)
+
+    # -- notifications --------------------------------------------
+    def notify(self, title, body):
+        # Only when the user is looking elsewhere -- otherwise the progress bar
+        # already shows it. That is exactly "tell me when I am away".
+        if self._closing or gui_extras.is_foreground(self.root):
+            return
+        try:
+            gui_extras.Toast(self.root, title, body, self.colors)
+            gui_extras.flash_taskbar(self.root)
+        except Exception:
+            pass
+
+    # -- auto-reconnect -------------------------------------------
+    def _watch_ports(self):
+        """Notice the Pi being plugged in or pulled out, and react.
+
+        Reconnect on its own when the Pi's gadget serial appears and nothing
+        else holds the port. Harmless while a tunnel runs or we are busy.
+        """
+        if self._closing:
+            return
+        try:
+            ports = sorted(serial.tools.list_ports.comports(),
+                           key=lambda p: p.device)
+            devices = {p.device for p in ports}
+            if devices != self._last_devices:
+                sel = self._selected_port()
+                self.ports = ports
+                self._fill_ports(keep=sel)
+                new = devices - self._last_devices
+                self._last_devices = devices
+                pi_dev = next((p.device for p in ports
+                               if (p.vid, p.pid) == GADGET), None)
+                if (self.auto_serial and pi_dev and pi_dev in new
+                        and not self.link and not self._link_busy
+                        and not self.proxy and not self._proxy_busy
+                        and not self._closing):
+                    self._say("Pi detected; connecting…", "dim")
+                    self._select_device(pi_dev)
+                    self._connect()
+        except Exception:
+            pass
+        self.root.after(1500, self._watch_ports)
+
+    def _select_device(self, dev):
+        for i, p in enumerate(self.ports):
+            if p.device == dev:
+                self.port_box.current(i)
+                return
 
     # -- shutdown -------------------------------------------------
     def close(self):

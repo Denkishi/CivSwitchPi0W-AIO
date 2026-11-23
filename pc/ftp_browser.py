@@ -12,6 +12,7 @@ Threading follows the GUI's rule: FTP runs on worker threads, which never
 touch Tk -- they post callbacks through host._ui().
 """
 
+import json
 import os
 import queue
 import shutil
@@ -26,6 +27,33 @@ import ftp_client
 from ftp_client import Cancelled, FtpError
 
 DEFAULT_FTP_PORT = "1337"
+
+# Files small enough to preview/edit as text, and the extensions worth it.
+PREVIEW_MAX = 512 * 1024
+TEXT_EXTS = {".txt", ".ini", ".json", ".cfg", ".conf", ".log", ".md", ".js",
+             ".xml", ".html", ".csv", ".yml", ".yaml", ".toml", ".py", ".sh",
+             ".bat", ".nfo", ""}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BOOKMARK_FILE = os.path.join(_HERE, "civswitch_bookmarks.json")
+
+
+def _load_bookmarks():
+    try:
+        with open(BOOKMARK_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [p for p in data if isinstance(p, str)]
+    except Exception:
+        return ["/switch", "/atmosphere"]
+
+
+def _save_bookmarks(paths):
+    try:
+        with open(BOOKMARK_FILE, "w", encoding="utf-8") as fh:
+            json.dump(paths, fh)
+    except Exception:
+        pass
 
 TYPES = {
     ".nro": "Homebrew app", ".nsp": "Switch package", ".nsz": "Switch package",
@@ -217,10 +245,14 @@ class FileBrowser(ttk.Frame):
         self._editor = None
         self._drag = None
         self._drop_mark = None
+        self.search_mode = False
+        self.search_hits = {}       # row id -> remote path, during a search
+        self.bookmarks = _load_bookmarks()
 
         self._icons()
         self._build()
         self._bind_keys()
+        self._refresh_bookmarks()
         self._tick()
 
     def px(self, n):
@@ -281,14 +313,48 @@ class FileBrowser(ttk.Frame):
         ttk.Label(nav, text="Filter").pack(side=tk.LEFT)
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._render())
-        self.filter_entry = ttk.Entry(nav, textvariable=self.filter_var, width=16)
-        self.filter_entry.pack(side=tk.LEFT, padx=(4, 0))
+        self.filter_entry = ttk.Entry(nav, textvariable=self.filter_var, width=14)
+        self.filter_entry.pack(side=tk.LEFT, padx=(4, 6))
         self.filter_entry.bind("<Escape>", lambda _e: (self.filter_var.set(""),
                                                        self.tree.focus_set()))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(nav, textvariable=self.search_var, width=16)
+        self.search_entry.pack(side=tk.LEFT)
+        self.search_entry.bind("<Return>", lambda _e: self.search())
+        self.search_entry.bind("<Escape>", lambda _e: self.clear_search())
+        _ph = "Search whole SD…"
+        self.search_entry.insert(0, _ph)
+
+        def _ph_in(_e):
+            if self.search_var.get() == _ph:
+                self.search_entry.delete(0, tk.END)
+
+        def _ph_out(_e):
+            if not self.search_var.get():
+                self.search_entry.insert(0, _ph)
+        self.search_entry.bind("<FocusIn>", _ph_in)
+        self.search_entry.bind("<FocusOut>", _ph_out)
+        self._search_ph = _ph
+        self.b_search = ttk.Button(nav, text="⌕", width=3, style="Tool.TButton",
+                                   command=self.search)
+        self.b_search.pack(side=tk.LEFT, padx=(2, 0))
 
         # Row 2: actions
         act = ttk.Frame(self)
         act.pack(fill=tk.X, pady=(6, 0))
+        self.b_tools = ttk.Menubutton(act, text="Tools")
+        self.tools_menu = tk.Menu(self.b_tools, tearoff=False)
+        self.bm_menu = tk.Menu(self.tools_menu, tearoff=False)
+        self.tools_menu.add_cascade(label="Bookmarks", menu=self.bm_menu)
+        self.tools_menu.add_command(label="Disk usage here",
+                                    command=self.disk_usage)
+        self.tools_menu.add_command(label="Search whole SD…",
+                                    command=lambda: self.search_entry.focus_set())
+        self.b_tools["menu"] = self.tools_menu
+        self.b_tools.pack(side=tk.LEFT, padx=(0, 4))
+        self.preview_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(act, text="Preview", variable=self.preview_on,
+                        command=self._toggle_preview).pack(side=tk.LEFT, padx=(0, 4))
         self.b_upload = ttk.Menubutton(act, text="Upload")
         up_menu = tk.Menu(self.b_upload, tearoff=False)
         up_menu.add_command(label="Files…", command=self.upload_files)
@@ -355,6 +421,35 @@ class FileBrowser(ttk.Frame):
         self.tree.tag_configure("cut", foreground="#9aa0a6")
         self.tree.tag_configure("drop", background="#ffe9a8")
 
+        # Preview pane (right): text (editable) or image of the selected file.
+        self.pane = pane
+        self.pv = ttk.Frame(pane)
+        pv_head = ttk.Frame(self.pv)
+        pv_head.pack(fill=tk.X)
+        self.pv_name = ttk.Label(pv_head, text="Preview", foreground="#555",
+                                 anchor=tk.W)
+        self.pv_name.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.pv_edit = ttk.Button(pv_head, text="Edit", width=6, style="Tool.TButton",
+                                  command=self._edit_toggle, state=tk.DISABLED)
+        self.pv_edit.pack(side=tk.RIGHT)
+        self.pv_save = ttk.Button(pv_head, text="Save", width=6, style="Tool.TButton",
+                                  command=self._edit_save)
+        self.pv_text = tk.Text(self.pv, wrap=tk.NONE, font=("Consolas", 9),
+                               undo=True, state=tk.DISABLED, relief=tk.FLAT,
+                               background="#fbfbfb")
+        pvsb = ttk.Scrollbar(self.pv, orient=tk.VERTICAL, command=self.pv_text.yview)
+        self.pv_text.configure(yscrollcommand=pvsb.set)
+        self.pv_img_lbl = ttk.Label(self.pv, anchor=tk.CENTER, background="#fbfbfb")
+        self.pv_hint = ttk.Label(self.pv, foreground="#999", anchor=tk.CENTER,
+                                 wraplength=self.px(200))
+        self.pv_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
+        pvsb.pack(side=tk.RIGHT, fill=tk.Y, pady=(4, 0))
+        self.pane.add(self.pv, weight=3)
+        self._pv_file = None        # (path, Entry) currently previewed
+        self._pv_img = None         # keep PhotoImage alive
+        self._editing = False
+        self._pv_token = 0
+
         # Empty / disconnected state, laid over both panes.
         self.overlay = ttk.Frame(holder, padding=24)
         self.ov_title = ttk.Label(self.overlay, font=("Segoe UI", 12, "bold"))
@@ -389,6 +484,19 @@ class FileBrowser(ttk.Frame):
         self.menu = tk.Menu(self, tearoff=False)
         self._update_actions()
 
+    def apply_colors(self, c):
+        """Recolour the tk widgets the ttk theme does not reach."""
+        for t in (self.tree, self.side):
+            t.tag_configure("drop", background=c["drop"])
+        self.tree.tag_configure("odd", background=c["odd"])
+        self.tree.tag_configure("cut", foreground=c["cut"])
+        self.pv_text.config(background=c["log_bg"], foreground=c["text"],
+                            insertbackground=c["text"])
+        self.pv_img_lbl.config(background=c["log_bg"])
+        for lbl in (self.status_l, self.status_r, self.pv_name, self.pv_hint,
+                    self.xfer_l, self.ov_text):
+            lbl.config(foreground=c["muted"])
+
     def _bind_keys(self):
         t = self.tree
         t.bind("<Double-1>", self._on_double)
@@ -406,8 +514,10 @@ class FileBrowser(ttk.Frame):
         t.bind("<Control-l>", lambda _e: self._focus_path())
         t.bind("<Control-f>", lambda _e: self.filter_entry.focus_set())
         t.bind("<Button-3>", self._on_right_click)
+        t.bind("<Control-f>", lambda _e: self.search_entry.focus_set())
         t.bind("<<TreeviewSelect>>", lambda _e: (self._update_status(),
-                                                 self._update_actions()))
+                                                 self._update_actions(),
+                                                 self._preview_selected()))
         # Dragging rows onto folders (here or in the folder tree) moves them.
         t.bind("<ButtonPress-1>", self._drag_press)
         t.bind("<B1-Motion>", self._drag_motion)
@@ -510,6 +620,9 @@ class FileBrowser(ttk.Frame):
         self.side.delete(*self.side.get_children())
         self.path_var.set("/")
         self._overlay_state = None
+        self._editing = False
+        self._pv_file = None
+        self._pv_clear("Not connected.")
         self._update_status()
         self._update_actions()
 
@@ -850,6 +963,239 @@ class FileBrowser(ttk.Frame):
         self.b_delete.config(state=st(sel))
         self.b_conn.config(text="Disconnect" if self.nav else "Connect",
                            state=st(self.nav or self.host.browser_state() == "ready"))
+        self.b_tools.config(state=st(on))
+        self.b_search.config(state=st(on))
+
+    # -- bookmarks ------------------------------------------------
+    def _refresh_bookmarks(self):
+        m = self.bm_menu
+        m.delete(0, tk.END)
+        m.add_command(label="Bookmark this folder",
+                      command=self._add_bookmark)
+        if self.bookmarks:
+            m.add_separator()
+            for path in self.bookmarks:
+                m.add_command(label=path, command=lambda p=path: self.go(p))
+            m.add_separator()
+            rm = tk.Menu(m, tearoff=False)
+            for path in self.bookmarks:
+                rm.add_command(label=path, command=lambda p=path: self._del_bookmark(p))
+            m.add_cascade(label="Remove", menu=rm)
+
+    def _add_bookmark(self):
+        if self.connected and self.cwd not in self.bookmarks:
+            self.bookmarks.append(self.cwd)
+            _save_bookmarks(self.bookmarks)
+            self._refresh_bookmarks()
+            self._say(f"bookmarked {self.cwd}", "dim")
+
+    def _del_bookmark(self, path):
+        if path in self.bookmarks:
+            self.bookmarks.remove(path)
+            _save_bookmarks(self.bookmarks)
+            self._refresh_bookmarks()
+
+    # -- search ---------------------------------------------------
+    def search(self):
+        if not (self.nav and self.connected):
+            return
+        q = self.search_var.get().strip()
+        if not q or q == self._search_ph:
+            return
+        SearchWindow(self, q, self.cwd)
+
+    def clear_search(self):
+        self.search_var.set("")
+        self.tree.focus_set()
+
+    # -- disk usage -----------------------------------------------
+    def disk_usage(self):
+        if self.nav and self.connected:
+            UsageWindow(self, self.cwd)
+
+    def scan(self, root, on_entry, on_done, cancel_evt):
+        """Walk `root` on the console, streaming (path, Entry) to on_entry.
+
+        Runs on the transfer session so browsing stays responsive. on_entry
+        and on_done are called on the Tk thread already.
+        """
+        sess = self._xfer_session()
+        if not sess:
+            on_done("not connected")
+            return
+
+        def job(ftp):
+            n = 0
+            for path, e in ftp.walk(root):
+                if cancel_evt.is_set():
+                    break
+                n += 1
+                self._ui(on_entry, path, e)
+            self._ui(on_done, None)
+
+        def fail(exc):
+            self._ui(on_done, str(exc))
+        sess.submit(job, fail, retry=True)
+
+    # -- preview --------------------------------------------------
+    def _toggle_preview(self):
+        if self.preview_on.get():
+            try:
+                self.pane.add(self.pv, weight=3)
+            except tk.TclError:
+                pass
+            self._preview_selected()
+        else:
+            if self._editing:
+                self._edit_toggle(discard=True)
+            try:
+                self.pane.forget(self.pv)
+            except tk.TclError:
+                pass
+
+    def _preview_selected(self):
+        if not self.preview_on.get():
+            return
+        if self._editing:
+            return          # don't blow away unsaved edits on selection change
+        sel = self._selected()
+        if len(sel) != 1 or sel[0].is_dir:
+            self._pv_clear("Select a file to preview it.")
+            return
+        e = sel[0]
+        path = rjoin(self.cwd, e.name)
+        self._pv_file = (path, e)
+        ext = os.path.splitext(e.name)[1].lower()
+        self.pv_name.config(text=e.name)
+        self.pv_edit.config(state=tk.DISABLED, text="Edit")
+        self.pv_save.pack_forget()
+        if e.size > PREVIEW_MAX:
+            self._pv_clear(f"{human(e.size)} — too large to preview.\n"
+                           "Download it to open.")
+            return
+        if ext in IMAGE_EXTS:
+            self._pv_show_hint("Loading image…")
+            self._pv_fetch(path, e, "image")
+        elif ext in TEXT_EXTS:
+            self._pv_show_hint("Loading…")
+            self._pv_fetch(path, e, "text")
+        else:
+            self._pv_clear(f"{kind_of(e)} — no preview.\n"
+                           "Double-click to download.")
+
+    def _pv_clear(self, hint=""):
+        self._pv_file = self._pv_file if self._editing else None
+        self.pv_text.pack_forget()
+        self.pv_img_lbl.pack_forget()
+        self.pv_save.pack_forget()
+        self.pv_edit.config(state=tk.DISABLED)
+        self.pv_name.config(text="Preview")
+        self.pv_hint.config(text=hint)
+        self.pv_hint.pack(fill=tk.BOTH, expand=True, pady=20)
+
+    def _pv_show_hint(self, hint):
+        self.pv_text.pack_forget()
+        self.pv_img_lbl.pack_forget()
+        self.pv_hint.config(text=hint)
+        self.pv_hint.pack(fill=tk.BOTH, expand=True, pady=20)
+
+    def _pv_fetch(self, path, entry, kind):
+        self._pv_token += 1
+        token = self._pv_token
+        import io
+        buf = io.BytesIO()
+
+        def job(ftp):
+            ftp.retrieve(path, buf, size=entry.size or None)
+            data = buf.getvalue()
+            self._ui(self._pv_render, token, path, entry, kind, data)
+
+        def fail(exc):
+            self._ui(lambda: token == self._pv_token
+                     and self._pv_clear(f"preview failed: {exc}"))
+        # Preview reads go on the transfer session so browsing stays responsive.
+        sess = self._xfer_session()
+        if sess:
+            sess.submit(job, fail, retry=True)
+
+    def _pv_render(self, token, path, entry, kind, data):
+        if token != self._pv_token or self._pv_file != (path, entry):
+            return
+        self.pv_hint.pack_forget()
+        if kind == "image":
+            img = self._make_image(data)
+            if img is None:
+                self._pv_clear("Cannot show this image.\nDownload to open.")
+                return
+            self._pv_img = img
+            self.pv_text.pack_forget()
+            self.pv_img_lbl.config(image=img)
+            self.pv_img_lbl.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+            self.pv_edit.config(state=tk.DISABLED)
+        else:
+            text = data.decode("utf-8", "replace")
+            self.pv_img_lbl.pack_forget()
+            self.pv_text.config(state=tk.NORMAL)
+            self.pv_text.delete("1.0", tk.END)
+            self.pv_text.insert("1.0", text)
+            self.pv_text.edit_reset()
+            self.pv_text.config(state=tk.DISABLED)
+            self.pv_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
+            self.pv_edit.config(state=tk.NORMAL)
+
+    def _make_image(self, data):
+        # Tk 9 reads PNG/GIF natively; Pillow (if present) handles the rest and
+        # lets us downscale big images to the pane.
+        try:
+            from PIL import Image, ImageTk
+            import io
+            im = Image.open(io.BytesIO(data))
+            im.thumbnail((self.px(260), self.px(360)))
+            return ImageTk.PhotoImage(im, master=self)
+        except Exception:
+            pass
+        try:
+            import base64
+            return tk.PhotoImage(master=self, data=base64.b64encode(data))
+        except Exception:
+            return None
+
+    def _edit_toggle(self, discard=False):
+        if self._editing:
+            self._editing = False
+            self.pv_edit.config(text="Edit")
+            self.pv_save.pack_forget()
+            self.pv_text.config(state=tk.DISABLED)
+            if not discard:
+                self._preview_selected()
+            return
+        if not self._pv_file:
+            return
+        self._editing = True
+        self.pv_edit.config(text="Cancel")
+        self.pv_save.pack(side=tk.RIGHT, padx=(0, 4))
+        self.pv_text.config(state=tk.NORMAL)
+        self.pv_text.focus_set()
+
+    def _edit_save(self):
+        if not (self._editing and self._pv_file):
+            return
+        path, entry = self._pv_file
+        text = self.pv_text.get("1.0", "end-1c")
+        data = text.encode("utf-8")
+        self._editing = False
+        self.pv_edit.config(text="Edit")
+        self.pv_save.pack_forget()
+        self.pv_text.config(state=tk.DISABLED)
+        cwd = self.cwd
+        label = f"save {os.path.basename(path)}"
+
+        def work(ftp):
+            import io
+            ftp.store(io.BytesIO(data), path)
+            self._ui(self._say, f"saved {path} ({human(len(data))})", "dim")
+            self._ui(self._after_change, cwd, [entry.name])
+        self._queue_transfer(label, work)
 
     # -- events ---------------------------------------------------
     def _on_double(self, event):
@@ -1314,10 +1660,9 @@ class FileBrowser(ttk.Frame):
         def job(ftp):
             self.cancel_evt.clear()
             work(ftp)
-            self._ui(self._transfer_done)
+            self._ui(self._transfer_done, label, None)
 
         def fail(exc):      # runs instead of _transfer_done above on any error
-            self._ui(self._transfer_done)
             if isinstance(exc, Cancelled):
                 self._ui(self._say, f"{label}: cancelled", "dim")
                 self._ui(self.xfer_l.config, {"text": "Cancelled"})
@@ -1325,11 +1670,23 @@ class FileBrowser(ttk.Frame):
                 self._ui(self._say, f"{label} failed: {exc}", "err")
                 self._ui(self.xfer_l.config, {"text": f"{label} failed"})
             self._ui(self._after_change, self.cwd, [])
+            self._ui(self._transfer_done, label, exc)
         sess.submit(job, fail, retry=False)
 
-    def _transfer_done(self):
+    def _transfer_done(self, label="", exc=None):
         self.xfer_count = max(0, self.xfer_count - 1)
+        if exc is not None and not isinstance(exc, Cancelled):
+            self._xfer_failed = True
         self._show_queue()
+        if self.xfer_count == 0:
+            # A batch finished: tell the user if they are away.
+            notify = getattr(self.host, "notify", None)
+            if notify:
+                if getattr(self, "_xfer_failed", False):
+                    notify("Transfer failed", str(label))
+                else:
+                    notify("Transfers complete", self.xfer_l.cget("text"))
+            self._xfer_failed = False
 
     def _show_queue(self):
         busy = self.xfer_count > 0
@@ -1554,3 +1911,245 @@ class FileBrowser(ttk.Frame):
             self._ui(self._side_refresh, dest)
             self._ui(self._after_change, dest, names)
         self._queue_transfer(label, work)
+
+
+class SearchWindow(tk.Toplevel):
+    """Recursive name search across the SD, results stream in as found."""
+
+    def __init__(self, browser, query, root):
+        super().__init__(browser)
+        self.browser = browser
+        self.query = query.lower()
+        self.root = "/"      # always search the whole card
+        self.cancel = threading.Event()
+        self.hits = {}       # row id -> (path, Entry)
+        self.n = 0
+        self.title(f"Search: {query}")
+        self.geometry(f"{browser.px(560)}x{browser.px(420)}")
+        self.transient(browser.winfo_toplevel())
+
+        top = ttk.Frame(self, padding=6)
+        top.pack(fill=tk.X)
+        self.q = tk.StringVar(value=query)
+        e = ttk.Entry(top, textvariable=self.q)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind("<Return>", lambda _ev: self._restart())
+        ttk.Button(top, text="Search", command=self._restart).pack(side=tk.LEFT,
+                                                                    padx=(6, 0))
+        self.count = ttk.Label(self, text="", foreground="#555", anchor=tk.W,
+                               padding=(6, 0))
+        self.count.pack(fill=tk.X)
+        holder = ttk.Frame(self, padding=6)
+        holder.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(holder, columns=("size", "folder"),
+                                 show="tree headings", selectmode="browse",
+                                 style="Files.Treeview")
+        self.tree.heading("#0", text="Name")
+        self.tree.heading("size", text="Size", anchor=tk.E)
+        self.tree.heading("folder", text="Folder")
+        self.tree.column("#0", width=browser.px(200))
+        self.tree.column("size", width=browser.px(80), anchor=tk.E, stretch=False)
+        self.tree.column("folder", width=browser.px(240))
+        sb = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", lambda _e: self._open())
+        self.tree.bind("<Return>", lambda _e: self._open())
+
+        bar = ttk.Frame(self, padding=(6, 0, 6, 6))
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="Go to folder", command=self._open).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Download", command=self._download).pack(side=tk.LEFT,
+                                                                       padx=6)
+        self.stop_btn = ttk.Button(bar, text="Stop", command=self._stop)
+        self.stop_btn.pack(side=tk.RIGHT)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._start()
+
+    def _start(self):
+        self.cancel.clear()
+        self.hits.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.n = 0
+        self.count.config(text="Searching...")
+        self.stop_btn.config(state=tk.NORMAL)
+        self.browser.scan(self.root, self._on_entry, self._on_done, self.cancel)
+
+    def _restart(self):
+        self.query = self.q.get().strip().lower()
+        if self.query:
+            self.cancel.set()
+            self.after(150, self._start)
+
+    def _on_entry(self, path, e):
+        if self.cancel.is_set() or not self.winfo_exists():
+            return
+        if self.query in e.name.lower() and not e.is_dir:
+            self.n += 1
+            icon = self.browser.ic_app if e.name.lower().endswith(".nro") \
+                else self.browser.ic_file
+            self.tree.insert("", tk.END, iid=path, text="  " + e.name, image=icon,
+                             values=(human(e.size), rparent(path)))
+            self.hits[path] = (path, e)
+            self.count.config(text=f"{self.n} match(es)...")
+
+    def _on_done(self, err):
+        if not self.winfo_exists():
+            return
+        self.stop_btn.config(state=tk.DISABLED)
+        if err:
+            self.count.config(text=f"Stopped: {err}")
+        else:
+            self.count.config(text=f"{self.n} match(es)"
+                              + (" - stopped" if self.cancel.is_set() else ""))
+
+    def _sel(self):
+        s = self.tree.selection()
+        return self.hits.get(s[0]) if s else None
+
+    def _open(self):
+        hit = self._sel()
+        if hit:
+            self.browser.go(rparent(hit[0]), select=[hit[1].name])
+            self.browser.winfo_toplevel().lift()
+
+    def _download(self):
+        hit = self._sel()
+        if hit:
+            self.browser.go(rparent(hit[0]), select=[hit[1].name])
+            self.after(400, self.browser.download)
+
+    def _stop(self):
+        self.cancel.set()
+
+    def _close(self):
+        self.cancel.set()
+        self.destroy()
+
+
+class UsageWindow(tk.Toplevel):
+    """What is taking up space under a folder, biggest first, with bars."""
+
+    def __init__(self, browser, root):
+        super().__init__(browser)
+        self.browser = browser
+        self.root = root
+        self.cancel = threading.Event()
+        self.sizes = {}      # immediate child name -> bytes
+        self.files = {}      # immediate child name -> count
+        self.is_dir = {}
+        self.total = 0
+        self.title(f"Disk usage: {root}")
+        self.geometry(f"{browser.px(520)}x{browser.px(420)}")
+        self.transient(browser.winfo_toplevel())
+
+        self.head = ttk.Label(self, text=f"Scanning {root}...", padding=6,
+                              foreground="#555", anchor=tk.W)
+        self.head.pack(fill=tk.X)
+        holder = ttk.Frame(self, padding=6)
+        holder.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(holder, columns=("size", "bar", "files"),
+                                 show="tree headings", selectmode="browse",
+                                 style="Files.Treeview")
+        self.tree.heading("#0", text="Item")
+        self.tree.heading("size", text="Size", anchor=tk.E)
+        self.tree.heading("bar", text="Share")
+        self.tree.heading("files", text="Files", anchor=tk.E)
+        self.tree.column("#0", width=browser.px(190))
+        self.tree.column("size", width=browser.px(90), anchor=tk.E, stretch=False)
+        self.tree.column("bar", width=browser.px(150), stretch=False)
+        self.tree.column("files", width=browser.px(60), anchor=tk.E, stretch=False)
+        sb = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", lambda _e: self._open())
+
+        bar = ttk.Frame(self, padding=(6, 0, 6, 6))
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="Open folder", command=self._open).pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(bar, text="Stop", command=self.cancel.set)
+        self.stop_btn.pack(side=tk.RIGHT)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.browser.scan(root, self._on_entry, self._on_done, self.cancel)
+        self._paint_job = self.after(400, self._repaint)
+
+    def _top(self, path):
+        rel = path[len(self.root):].lstrip("/") if self.root != "/" \
+            else path.lstrip("/")
+        return rel.split("/", 1)[0] if rel else None
+
+    def _on_entry(self, path, e):
+        top = self._top(path)
+        if top is None:
+            return
+        rest = path[len(self.root):].lstrip("/")
+        nested = "/" in rest
+        if e.is_dir:
+            self.sizes.setdefault(top, 0)
+            self.files.setdefault(top, 0)
+            if not nested:
+                self.is_dir[top] = True
+        else:
+            self.sizes[top] = self.sizes.get(top, 0) + e.size
+            self.files[top] = self.files.get(top, 0) + 1
+            if not nested:
+                self.is_dir.setdefault(top, False)
+            else:
+                self.is_dir.setdefault(top, True)
+            self.total += e.size
+
+    def _repaint(self):
+        if not self.winfo_exists():
+            return
+        self._render()
+        self._paint_job = self.after(500, self._repaint)
+
+    def _render(self):
+        order = sorted(self.sizes, key=lambda k: self.sizes[k], reverse=True)
+        self.tree.delete(*self.tree.get_children())
+        biggest = max(self.sizes.values(), default=1) or 1
+        for name in order:
+            size = self.sizes[name]
+            blocks = int(round(12 * size / biggest))
+            bar = "#" * blocks + "." * (12 - blocks)
+            icon = self.browser.ic_dir if self.is_dir.get(name) \
+                else self.browser.ic_file
+            self.tree.insert("", tk.END, iid=name, text="  " + name, image=icon,
+                             values=(human(size), bar, self.files.get(name, "")))
+        self.head.config(text=f"{self.root} - {human(self.total)} in "
+                         f"{len(self.sizes)} item(s)"
+                         + ("" if self.cancel.is_set() else " (scanning...)"))
+
+    def _on_done(self, err):
+        if not self.winfo_exists():
+            return
+        try:
+            self.after_cancel(self._paint_job)
+        except Exception:
+            pass
+        self._render()
+        self.stop_btn.config(state=tk.DISABLED)
+        self.head.config(text=f"{self.root} - {human(self.total)} in "
+                         f"{len(self.sizes)} item(s)"
+                         + (f" (stopped: {err})" if err else ""))
+
+    def _open(self):
+        s = self.tree.selection()
+        if s and self.is_dir.get(s[0]):
+            self.browser.go(rjoin(self.root, s[0]))
+            self.browser.winfo_toplevel().lift()
+
+    def _close(self):
+        self.cancel.set()
+        try:
+            self.after_cancel(self._paint_job)
+        except Exception:
+            pass
+        self.destroy()

@@ -8,3 +8,5 @@ prod.keys
 *.uf2
 *.img
 *.log
+civswitch_bookmarks.json
+civswitch_prefs.json
