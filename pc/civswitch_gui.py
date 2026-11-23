@@ -103,6 +103,7 @@ class App:
         ttk.Label(row, text="Console").pack(side=tk.LEFT)
         self.ip = tk.StringVar(value=DEFAULT_IP)
         ttk.Entry(row, textvariable=self.ip, width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row, text="port").pack(side=tk.LEFT, padx=(4, 2))
         self.tcp = tk.StringVar(value=DEFAULT_PORT)
         ttk.Entry(row, textvariable=self.tcp, width=7).pack(side=tk.LEFT)
         row2 = ttk.Frame(box)
@@ -121,10 +122,19 @@ class App:
         tbox.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
         trow = ttk.Frame(tbox)
         trow.pack(fill=tk.X)
-        self.tunnel_kind = tk.StringVar(value=list(TUNNELS)[1])
-        ttk.Combobox(trow, textvariable=self.tunnel_kind, width=30,
-                     state="readonly",
-                     values=list(TUNNELS)).pack(side=tk.LEFT)
+        self.tunnel_kind = tk.StringVar(value=list(TUNNELS)[0])
+        self.tunnel_combo = ttk.Combobox(trow, textvariable=self.tunnel_kind, width=27,
+                                         state="readonly",
+                                         values=list(TUNNELS))
+        self.tunnel_combo.pack(side=tk.LEFT)
+        self.tunnel_combo.bind("<<ComboboxSelected>>", self._on_tunnel_kind_changed)
+
+        ttk.Label(trow, text="port").pack(side=tk.LEFT, padx=(6, 2))
+        self.tunnel_port = tk.StringVar(value=DEFAULT_PORT)
+        self.tunnel_port_combo = ttk.Combobox(trow, textvariable=self.tunnel_port,
+                                             values=["9026", "8080"], width=6)
+        self.tunnel_port_combo.pack(side=tk.LEFT, padx=2)
+
         self.proxy_btn = ttk.Button(trow, text="Start", command=self._toggle_proxy)
         self.proxy_btn.pack(side=tk.LEFT, padx=6)
         self.proxy_lbl = ttk.Label(trow, text="stopped", foreground="#888")
@@ -369,6 +379,16 @@ class App:
         self._write(f"SEND {self.ip.get()} {port} {len(data)}", data)
 
     # -- tunnel ---------------------------------------------------
+    def _on_tunnel_kind_changed(self, _event=None):
+        kind = self.tunnel_kind.get()
+        if "SOCKS" in kind:
+            self.tunnel_port_combo["values"] = ["1080"]
+            self.tunnel_port.set(str(SOCKS_PORT))
+        else:
+            self.tunnel_port_combo["values"] = ["9026", "8080"]
+            if self.tunnel_port.get() == str(SOCKS_PORT):
+                self.tunnel_port.set(self.tcp.get() or DEFAULT_PORT)
+
     def _toggle_proxy(self):
         self._stop_proxy() if self.proxy else self._start_proxy()
 
@@ -386,6 +406,15 @@ class App:
             self._say("Start the bridge first: the relay needs it.", "err")
             return
 
+        port_str = self.tunnel_port.get().strip()
+        try:
+            port_num = int(port_str)
+            if not (1 <= port_num <= 65535):
+                raise ValueError
+        except ValueError:
+            self._say("Invalid tunnel port (1-65535).", "err")
+            return
+
         # One reader per COM port, so give ours up before the tunnel opens it.
         if self.ser:
             self._say("releasing the port for the tunnel", "dim")
@@ -394,9 +423,9 @@ class App:
 
         socks = script == SOCKS_TUNNEL
         cmd = [sys.executable, "-u", script, "--port", dev, "--console",
-               self.ip.get()]
+               self.ip.get(), "--listen-port", str(port_num)]
         if not socks:
-            cmd += ["--console-port", self.tcp.get()]
+            cmd += ["--console-port", str(port_num)]
         try:
             self.proxy = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -411,7 +440,7 @@ class App:
         threading.Thread(target=self._proxy_reader, daemon=True).start()
         self.proxy_btn.config(text="Stop")
         self.conn_btn.config(state=tk.DISABLED)
-        where = f"127.0.0.1:{SOCKS_PORT}" if socks else f"127.0.0.1:{self.tcp.get()}"
+        where = f"127.0.0.1:{port_num}"
         self.proxy_lbl.config(text=f"running · {where}", foreground="#2a7")
         self._status("tunnel running", "#2a7")
         if socks:
@@ -470,8 +499,9 @@ class App:
             self._say("Invalid FTP port.", "err")
             return
         try:
+            s_port = int(self.tunnel_port.get().strip()) if self.tunnel_port.get().strip().isdigit() else SOCKS_PORT
             self.ftp = ftp_client.Ftp(self.ip.get(), port,
-                                      ("127.0.0.1", SOCKS_PORT)).connect()
+                                      ("127.0.0.1", s_port)).connect()
         except Exception as e:
             self.ftp = None
             self._say(f"FTP: {e}", "err")

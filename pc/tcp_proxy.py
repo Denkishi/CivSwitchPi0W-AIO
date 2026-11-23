@@ -98,15 +98,32 @@ class Bridge:
 
 
 def read_request(conn):
-    """Collect what the tool sends, until it half-closes or falls quiet."""
+    """Collect what the tool sends, until it half-closes, completes HTTP, or falls quiet."""
     conn.settimeout(30)
     data = b""
+    expected_len = None
     try:
         while True:
             chunk = conn.recv(65536)
             if not chunk:          # client half-closed: the normal path
                 break
             data += chunk
+
+            # If this is an HTTP request with Content-Length, check if complete
+            if expected_len is None and b"\r\n\r\n" in data:
+                header_end = data.find(b"\r\n\r\n") + 4
+                headers = data[:header_end].lower()
+                cl_idx = headers.find(b"content-length:")
+                if cl_idx != -1:
+                    line_end = headers.find(b"\r\n", cl_idx)
+                    try:
+                        cl_val = int(headers[cl_idx + 15:line_end].strip())
+                        expected_len = header_end + cl_val
+                    except ValueError:
+                        pass
+            if expected_len is not None and len(data) >= expected_len:
+                break
+
             conn.settimeout(READ_IDLE)
     except socket.timeout:
         pass
