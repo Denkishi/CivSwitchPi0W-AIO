@@ -143,12 +143,33 @@ class Supervisor:
 
     def readline(self):
         if self._ser and self._ser.is_open:
-            raw = self._ser.readline()
+            try:
+                raw = self._ser.readline()
+            except OSError as e:
+                # The PC unplugged or re-plugged the cable: g_serial hangs the
+                # TTY up and every read fails from then on. Crashing here used
+                # to let systemd give up after three quick restarts, leaving
+                # the bridge up but the serial link dead until a reboot.
+                self._reopen_serial(f"serial link dropped ({e}); reopening")
+                return None
             if raw:
                 # A host is clearly attached now, so replies can go out.
+                if not self._host_seen:
+                    log("host is talking on the serial link")
                 self._host_seen = True
                 return raw.decode("utf-8", "replace").rstrip("\r\n")
         return None
+
+    def _reopen_serial(self, why):
+        log(why)
+        try:
+            self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+        self._host_seen = False
+        time.sleep(1)
+        self.open_serial()
 
     # ── Info ──────────────────────────────────────────────────────
     def get_info(self):
@@ -448,7 +469,11 @@ class Supervisor:
         buf = b""
         deadline = time.monotonic() + timeout
         while len(buf) < length and time.monotonic() < deadline:
-            chunk = self._ser.read(length - len(buf))
+            try:
+                chunk = self._ser.read(length - len(buf))
+            except OSError as e:
+                log(f"serial read failed mid-payload: {e}")
+                break   # callers report the short payload; readline reopens
             if chunk:
                 buf += chunk
                 deadline = time.monotonic() + 20
@@ -612,6 +637,8 @@ class Supervisor:
             line = line.strip()
             if not line:
                 continue
+            if line != "INFO":   # the GUI polls INFO every few seconds
+                log(f"command: {line[:60]}")
 
             if line == "INFO":
                 info = self.get_info()

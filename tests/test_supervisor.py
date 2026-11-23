@@ -119,6 +119,29 @@ def run():
         assert "ERR name not updatable" in _out(sv)
         assert sv._ser.inp == b""
 
+        # A dropped USB link (the TTY is hung up) reopens the port instead of
+        # crashing the supervisor.
+        class _HungUp(_FakeSerial):
+            def readline(self):
+                raise OSError("device reports readiness to read but "
+                              "returned no data")
+
+            def close(self):
+                self.is_open = False
+
+        sv = _make(sup)
+        sv._ser = _HungUp()
+        reopened = []
+        sv.open_serial = lambda: (reopened.append(1),
+                                  setattr(sv, "_ser", _FakeSerial()))
+        sup.time.sleep, real_sleep = (lambda s: None), sup.time.sleep
+        try:
+            assert sv.readline() is None
+        finally:
+            sup.time.sleep = real_sleep
+        assert reopened == [1]
+        assert sv._host_seen is False and sv._ser is not None
+
         # Power actions reply at once and run systemctl off-thread.
         calls = []
         sup.subprocess.run = lambda *a, **k: calls.append(a[0])
