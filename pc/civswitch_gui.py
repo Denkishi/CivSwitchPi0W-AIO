@@ -751,7 +751,8 @@ class App:
             self._say("Select a port first.", "err")
             return
         script = TUNNELS[self.tunnel_kind.get()]
-        if not os.path.isfile(script):
+        # Frozen: the tunnel is bundled as a module, not a .py on disk.
+        if not FROZEN and not os.path.isfile(script):
             self._say(f"{os.path.basename(script)} not found next to this file.",
                       "err")
             return

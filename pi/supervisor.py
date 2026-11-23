@@ -681,6 +681,24 @@ class Supervisor:
                 self.write(json.dumps(self.get_diag()))
                 self.write_end()
 
+            elif line == "ANALYZE":
+                # Read-only boot timing report, so slow boots can be
+                # diagnosed over the cable without pulling the SD card.
+                for cmd in (["systemd-analyze"],
+                            ["systemd-analyze", "blame", "--no-pager"],
+                            ["systemd-analyze", "critical-chain",
+                             "civswitch.service", "--no-pager"]):
+                    try:
+                        out = subprocess.check_output(
+                            cmd, timeout=90, text=True,
+                            stderr=subprocess.STDOUT)
+                    except Exception as e:
+                        out = f"{' '.join(cmd)} failed: {e}"
+                    self.write(f"== {' '.join(cmd[1:]) or 'time'} ==")
+                    for ln in out.splitlines()[:25]:
+                        self.write(ln.rstrip())
+                self.write_end()
+
             elif line.startswith("UPDATE "):
                 parts = line.split()
                 if len(parts) not in (3, 4):
