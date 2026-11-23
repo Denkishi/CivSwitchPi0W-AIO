@@ -281,6 +281,11 @@ itself; the GUI already shows `AP 192.168.4.1` in green when you connect.
 3. In the GUI, set the console IP and port, pick a `.js` file, click **Send**.
    The loader's output comes back in the log.
 
+For payloads you use often, the **Payload** tab keeps a small library: write
+or import snippets, edit them in place, and **Send** one -- or pick several
+with Ctrl-click and **Send selected in order** to fire a chain. The console's
+reply streams into the tab. The library is saved to `civswitch_payloads.json`.
+
 **Stop bridge** hands the radio back to NetworkManager, so the Pi rejoins your
 Wi-Fi and SSH works again, about 15 seconds later. **Start bridge** puts it
 back. **Send** stays disabled until the bridge is actually up, and the bridge
@@ -517,8 +522,9 @@ corrupts it. `RELAY` is what the proxy uses.
 
 ```text
 pc/
-  civswitch_gui.py     PC GUI: bridge, payloads, commands, tunnel, Files tab
+  civswitch_gui.py     PC GUI: bridge, commands, tunnel, Files and Payload tabs
   ftp_browser.py       the Files tab: two-pane FTP file manager
+  payload_tab.py       the Payload tab: JS payload library, editor, sender
   gui_extras.py        light/dark theme, toasts, taskbar flash
   ftp_client.py        minimal FTP over SOCKS, also usable standalone
   pilink.py            clean shutdown helpers shared by the GUI and tunnels

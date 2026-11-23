@@ -10,3 +10,4 @@ prod.keys
 *.log
 civswitch_bookmarks.json
 civswitch_prefs.json
+civswitch_payloads.json

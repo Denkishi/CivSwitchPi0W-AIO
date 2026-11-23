@@ -32,6 +32,7 @@ import serial.tools.list_ports
 
 import ftp_browser
 import gui_extras
+import payload_tab
 import pilink
 import win_drop
 
@@ -246,6 +247,7 @@ class App:
         self._closing = False
         self._last_devices = set()  # COM devices seen, for auto-reconnect
         self.auto_serial = True     # reconnect when the Pi is replugged
+        self._payload_until = 0.0   # mirror replies to the Payload tab until
 
         self.dark = tk.BooleanVar(value=_load_pref("dark", False))
         self.colors = gui_extras.apply_theme(root, self.dark.get())
@@ -390,6 +392,9 @@ class App:
 
         self.browser = ftp_browser.FileBrowser(self.tabs, self)
         self.tabs.add(self.browser, text="  Files  ")
+
+        self.payload = payload_tab.PayloadTab(self.tabs, self)
+        self.tabs.add(self.payload, text="  Payload  ")
 
         self.log = scrolledtext.ScrolledText(root, height=7, wrap=tk.WORD,
                                              font=("Consolas", 9),
@@ -563,6 +568,11 @@ class App:
         if self.pending and any(m in line for m in DONE_MARKERS):
             self.pending = None
             self._refresh_controls()
+        # Mirror a payload's reply into the Payload tab for a short window
+        # after it was sent (the loader's output comes back as log lines).
+        if (self._payload_until and time.monotonic() < self._payload_until
+                and hasattr(self, "payload")):
+            self.payload.on_reply(line)
         self._say(line, "err" if "[ERROR]" in line
                   or line.startswith("ERR") else None)
 
@@ -857,6 +867,25 @@ class App:
         self._on_tunnel_kind_changed()
         self._start_proxy()
 
+    # -- hooks for the Payload tab --------------------------------
+    def console_target(self):
+        s = self.tcp.get().strip()
+        return self.ip.get().strip() or DEFAULT_IP, int(s) if s.isdigit() \
+            else int(DEFAULT_PORT)
+
+    def bridge_ready(self):
+        return bool(self.link and self.mode == "bridge" and not self.pending
+                    and not self.proxy)
+
+    def send_payload(self, ip, port, data):
+        """Fire one payload over the bridge. Returns True if it went out."""
+        if not self.bridge_ready():
+            return False
+        # Keep mirroring the console's reply into the Payload tab for a while.
+        self._payload_until = time.monotonic() + 30
+        self.link.send(f"SEND {ip} {port} {len(data)}\n".encode(), 0.1, data)
+        return True
+
     def _stop_proxy(self):
         proc = self.proxy
         if not proc:
@@ -899,6 +928,8 @@ class App:
         self.log.tag_configure("me", foreground=c["me"])
         if hasattr(self, "browser"):
             self.browser.apply_colors(c)
+        if hasattr(self, "payload"):
+            self.payload.apply_colors(c)
 
     # -- notifications --------------------------------------------
     def notify(self, title, body):
