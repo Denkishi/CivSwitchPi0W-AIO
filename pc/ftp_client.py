@@ -16,10 +16,12 @@ Standalone:
 """
 
 import argparse
+import datetime
 import re
 import socket
 import struct
 import sys
+from collections import namedtuple
 
 DEFAULT_PROXY = ("127.0.0.1", 1080)
 DEFAULT_HOST = "192.168.4.2"
@@ -28,8 +30,19 @@ DEFAULT_PORT = 1337
 PASV_RE = re.compile(r"(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)")
 
 
+MONTHS = {m: i for i, m in enumerate(
+    ("jan feb mar apr may jun jul aug sep oct nov dec").split(), 1)}
+
+# mtime is a datetime or None; link is the symlink target or "".
+Entry = namedtuple("Entry", "name is_dir size mtime link")
+
+
 class FtpError(RuntimeError):
     pass
+
+
+class Cancelled(Exception):
+    """Raised from a progress callback to abort a transfer."""
 
 
 def socks_connect(host, port, proxy=DEFAULT_PROXY, timeout=30):
@@ -63,6 +76,7 @@ class Ftp:
         self.user, self.password = user, password
         self.ctl = None
         self._buf = b""
+        self.confirmed = True
 
     # -- plumbing -------------------------------------------------
     def connect(self):
@@ -150,8 +164,11 @@ class Ftp:
         self._cmd(f"CWD {path}", (200, 250))
         return self.pwd()
 
+    def noop(self):
+        self._cmd("NOOP", (200, 250))
+
     def listdir(self, path=None):
-        """Return [(name, is_dir, size)] for path, or the current directory.
+        """Return [Entry] for path, or the current directory.
 
         Navigates with CWD and then lists with a bare LIST. This server
         answers "550 No such device" to LIST with a path argument, even for
@@ -178,18 +195,38 @@ class Ftp:
 
     @staticmethod
     def _parse_entry(line):
-        # Unix-style listing: perms links owner group size date... name
+        # Unix-style listing: perms links owner group size month day time|year name
         parts = line.split(None, 8)
-        if len(parts) < 9 or not parts[0][0] in "-dl":
+        if len(parts) < 9 or not parts[0] or parts[0][0] not in "-dl":
             return None
-        name = parts[8]
+        name, link = parts[8], ""
+        if parts[0].startswith("l") and " -> " in name:
+            name, link = name.split(" -> ", 1)
         if name in (".", ".."):
             return None
         try:
             size = int(parts[4])
         except ValueError:
             size = 0
-        return name, parts[0].startswith("d"), size
+        return Entry(name, parts[0].startswith("d"), size,
+                     Ftp._parse_date(parts[5], parts[6], parts[7]), link)
+
+    @staticmethod
+    def _parse_date(mon, day, tail):
+        try:
+            month = MONTHS[mon[:3].lower()]
+            day = int(day)
+            now = datetime.datetime.now()
+            if ":" in tail:
+                hh, mm = (int(x) for x in tail.split(":", 1))
+                dt = datetime.datetime(now.year, month, day, hh, mm)
+                # "Mon DD HH:MM" means within the last six months.
+                if dt > now + datetime.timedelta(days=2):
+                    dt = dt.replace(year=now.year - 1)
+                return dt
+            return datetime.datetime(int(tail), month, day)
+        except (KeyError, ValueError):
+            return None
 
     def _split(self, path):
         """CWD into the parent and return the bare name.
@@ -204,15 +241,54 @@ class Ftp:
         self.cwd(parent or "/")
         return name
 
-    def retrieve(self, remote, fileobj, progress=None):
+    # Seconds to wait for the end-of-transfer reply (see _finish_transfer).
+    RETR_WAIT = 8
+    STOR_WAIT = 15
+
+    def _finish_transfer(self, wait):
+        """Read the end-of-transfer reply without hanging on it.
+
+        If the far end of the data channel never learns the transfer ended
+        (an old Pi tunnel did not propagate the close), the server never says
+        226 and we used to sit until the 30 s socket timeout with the whole
+        UI blocked. All bytes are already through at this point, so wait a
+        few seconds at most, then start a fresh control connection -- the old
+        one would deliver that late 226 as the answer to the next command.
+
+        Returns True if the server confirmed the transfer.
+        """
+        old = self.ctl.gettimeout()
+        self.ctl.settimeout(wait)
+        try:
+            self._expect((226, 250))
+            return True
+        except socket.timeout:
+            pass
+        finally:
+            if self.ctl:
+                self.ctl.settimeout(old)
+        self.reconnect()
+        return False
+
+    def reconnect(self):
+        try:
+            self.ctl.close()
+        except Exception:
+            pass
+        self.ctl = None
+        self._buf = b""
+        self.connect()
+
+    def retrieve(self, remote, fileobj, progress=None, size=None):
+        """Download; with size given, stop as soon as that many bytes arrived."""
         remote = self._split(remote)
         data = self._pasv()
         self._send(f"RETR {remote}")
         self._expect((125, 150))
         total = 0
         try:
-            while True:
-                chunk = data.recv(8192)
+            while not (size and total >= size):
+                chunk = data.recv(65536)
                 if not chunk:
                     break
                 fileobj.write(chunk)
@@ -221,7 +297,7 @@ class Ftp:
                     progress(total)
         finally:
             data.close()
-        self._expect((226, 250))
+        self.confirmed = self._finish_transfer(self.RETR_WAIT)
         return total
 
     def store(self, local_fileobj, remote, progress=None):
@@ -232,26 +308,72 @@ class Ftp:
         total = 0
         try:
             while True:
-                chunk = local_fileobj.read(8192)
+                chunk = local_fileobj.read(32768)
                 if not chunk:
                     break
                 data.sendall(chunk)
                 total += len(chunk)
                 if progress:
                     progress(total)
+            # Say "that's all" explicitly before closing.
+            try:
+                data.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
         finally:
             data.close()
-        self._expect((226, 250))
+        self.confirmed = self._finish_transfer(self.STOR_WAIT)
         return total
+
+    def move(self, remote, dest_dir):
+        """Move remote into dest_dir with RNFR/RNTO (server-side, instant).
+
+        Raises FtpError if the server refuses a path in RNTO; the caller can
+        then fall back to copying through the PC.
+        """
+        name = self._split(remote)
+        self._cmd(f"RNFR {name}", 350)
+        target = (dest_dir.rstrip("/") + "/" + name) if dest_dir != "/" else "/" + name
+        self._cmd(f"RNTO {target}", (250, 200))
 
     def delete(self, remote):
         self._cmd(f"DELE {self._split(remote)}", (250, 200))
 
     def mkdir(self, remote):
-        self._cmd(f"MKD {remote}", (257, 250))
+        self._cmd(f"MKD {self._split(remote)}", (257, 250, 200))
 
     def rmdir(self, remote):
-        self._cmd(f"RMD {remote}", (250, 200))
+        self._cmd(f"RMD {self._split(remote)}", (250, 200))
+
+    def rename(self, remote, new_name):
+        """Rename within the same directory (new_name is a bare name)."""
+        name = self._split(remote)
+        self._cmd(f"RNFR {name}", 350)
+        self._cmd(f"RNTO {new_name}", (250, 200))
+
+    def walk(self, remote):
+        """Yield (path, Entry) for everything under remote, parents first."""
+        stack = [remote.rstrip("/") or "/"]
+        while stack:
+            top = stack.pop()
+            self.cwd(top)
+            for e in self.listdir():
+                path = (top.rstrip("/") + "/" + e.name)
+                yield path, e
+                if e.is_dir and not e.link:
+                    stack.append(path)
+
+    def rmtree(self, remote, on_item=None):
+        """Delete a directory and everything in it."""
+        items = list(self.walk(remote))
+        for path, e in reversed(items):     # children before parents
+            if on_item:
+                on_item(path)
+            if e.is_dir and not e.link:
+                self.rmdir(path)
+            else:
+                self.delete(path)
+        self.rmdir(remote)
 
 
 def main():
@@ -270,9 +392,10 @@ def main():
     try:
         ftp.connect()
         if args.list is not None:
-            for name, is_dir, size in ftp.listdir(args.list or None):
-                kind = "dir " if is_dir else "file"
-                print(f"{kind}  {size:>12}  {name}")
+            for e in ftp.listdir(args.list or None):
+                kind = "dir " if e.is_dir else "file"
+                when = e.mtime.strftime("%Y-%m-%d %H:%M") if e.mtime else " " * 16
+                print(f"{kind}  {e.size:>12}  {when}  {e.name}")
         elif args.get:
             with open(args.get[1], "wb") as fh:
                 n = ftp.retrieve(args.get[0], fh)

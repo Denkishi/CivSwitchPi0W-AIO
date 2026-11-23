@@ -31,6 +31,8 @@ import time
 import serial
 import serial.tools.list_ports
 
+import pilink
+
 BAUD = 115200
 GADGET = (0x0525, 0xA4A7)   # Linux Foundation / Gadget Serial
 READ_IDLE = 0.4             # client is done once it half-closes or goes quiet
@@ -49,6 +51,22 @@ class Bridge:
         self.lock = threading.Lock()
         time.sleep(1.0)
         self.ser.reset_input_buffer()
+
+    def close(self, stop_bridge=False):
+        """Free the port, optionally stopping the bridge first."""
+        if not self.lock.acquire(timeout=2):
+            # A relay is mid-flight; cut it short, we are leaving anyway.
+            for name in ("cancel_read", "cancel_write"):
+                try:
+                    getattr(self.ser, name)()
+                except Exception:
+                    pass
+        if stop_bridge:
+            pilink.stop_bridge(self.ser, log=lambda m: print(m, flush=True))
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
     def _readline(self, timeout):
         deadline = time.monotonic() + timeout
@@ -177,18 +195,30 @@ def main():
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--listen-port", type=int, default=9026)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--parent-watch", action="store_true",
+                    help="exit cleanly when stdin closes (used by the GUI)")
     args = ap.parse_args()
 
     dev = args.port or find_gadget()
     if not dev:
         print("Pi non trovato: specifica --port COMx", file=sys.stderr)
         return 1
+
+    holder = {}
+    if args.parent_watch:
+        def on_exit(stop):
+            bridge = holder.get("bridge")
+            if bridge:
+                bridge.close(stop_bridge=stop)
+        pilink.watch_parent(on_exit)
+
     try:
         bridge = Bridge(dev)
     except Exception as e:
         print(f"{dev}: {e}", file=sys.stderr)
         print("la GUI tiene la porta? disconnettila prima.", file=sys.stderr)
         return 1
+    holder["bridge"] = bridge
     print(f"seriale: {dev}", flush=True)
 
     try:

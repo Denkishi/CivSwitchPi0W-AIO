@@ -7,3 +7,4 @@ build/
 prod.keys
 *.uf2
 *.img
+*.log

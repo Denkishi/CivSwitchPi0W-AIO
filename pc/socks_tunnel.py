@@ -30,6 +30,8 @@ import time
 import serial
 import serial.tools.list_ports
 
+import pilink
+
 BAUD = 115200
 GADGET = (0x0525, 0xA4A7)
 
@@ -98,6 +100,7 @@ class Link:
         # 127.0.0.1 -- while keeping the PASV port, so the data channel would
         # aim at the PC. We know the real host from the control connection.
         self.console_host = None
+        self._rthread = None
         time.sleep(1.0)
 
     # -- setup ----------------------------------------------------
@@ -110,7 +113,8 @@ class Link:
         command -- after a QUIT to clear any half-dead session.
         """
         self.ser.reset_input_buffer()
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._rthread = threading.Thread(target=self._reader, daemon=True)
+        self._rthread.start()
 
         self.send(PING, 0)
         if self.ready.wait(3):
@@ -134,7 +138,10 @@ class Link:
                 self.say(f"write failed: {e}")
 
     def say(self, msg):
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass                # parent gone; the stdin watcher handles exit
 
     def _reader(self):
         while self.running:
@@ -216,15 +223,21 @@ class Link:
             except Exception:
                 pass
 
-    def close(self):
+    def close(self, stop_bridge=False):
+        """Leave tunnel mode cleanly, optionally stop the bridge, free the port."""
         self.running = False
+        if self._rthread and self._rthread is not threading.current_thread():
+            self._rthread.join(1.0)
         for cid in list(self.channels):
             self.drop(cid)
         try:
-            self.send(QUIT, 0)
-            time.sleep(0.3)
+            self.ser.write_timeout = 3
         except Exception:
             pass
+        self.send(QUIT, 0)
+        time.sleep(0.5)
+        if stop_bridge:
+            pilink.stop_bridge(self.ser, log=self.say)
         try:
             self.ser.close()
         except Exception:
@@ -367,12 +380,23 @@ def main():
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--listen-port", type=int, default=1080)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--parent-watch", action="store_true",
+                    help="exit cleanly when stdin closes (used by the GUI)")
     args = ap.parse_args()
 
     dev = args.port or find_gadget()
     if not dev:
         print("Pi not found: pass --port COMx", file=sys.stderr)
         return 1
+
+    holder = {}
+    if args.parent_watch:
+        def on_exit(stop):
+            link = holder.get("link")
+            if link:
+                link.close(stop_bridge=stop)
+        pilink.watch_parent(on_exit)
+
     try:
         link = Link(dev, args.verbose)
     except Exception as e:
@@ -380,6 +404,7 @@ def main():
         print("is the GUI holding the port? disconnect it first.", file=sys.stderr)
         return 1
 
+    holder["link"] = link
     link.console_host = args.console
     print(f"serial: {dev}", flush=True)
     if not link.enter_tunnel_mode():

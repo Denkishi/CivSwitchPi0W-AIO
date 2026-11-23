@@ -283,7 +283,12 @@ itself; the GUI already shows `AP 192.168.4.1` in green when you connect.
 
 **Stop bridge** hands the radio back to NetworkManager, so the Pi rejoins your
 Wi-Fi and SSH works again, about 15 seconds later. **Start bridge** puts it
-back. **Send** stays disabled until the bridge is actually up.
+back. **Send** stays disabled until the bridge is actually up, and the bridge
+button is locked while the Pi is busy starting or stopping it.
+
+With **Stop bridge on exit** ticked (the default), closing the GUI also stops
+the bridge and shuts down any tunnel it started, so nothing is left holding
+the COM port. The Pi still autostarts the bridge on its next boot.
 
 The command box at the bottom sends raw protocol commands (`INFO`, `STATUS`,
 `SCAN`, `BRIDGE`, `STOP`) and prints the reply, which is useful when you want
@@ -369,14 +374,24 @@ With a homebrew FTP server running on the console (kaiHEN ships one), the GUI
 can browse its SD card directly -- no FileZilla, no proxy settings.
 
 1. Start the bridge.
-2. In **Tunnel**, pick **SOCKS5** and click **Start**.
-3. In **Console files**, set the port (kaiHEN defaults to `1337`) and click
-   **Connect**.
+2. Open the **Files** tab and click **Start tunnel and connect** (the FTP port
+   defaults to kaiHEN's `1337`). The tab connects on its own whenever the
+   SOCKS5 tunnel is up.
 
-Then double-click to enter directories or download, and use **Up**,
-**Refresh**, **Download**, **Upload** and **Delete**. A progress bar shows
-bytes, percentage and rate, so a slow transfer is distinguishable from a
-stalled one.
+It works like a desktop file manager:
+
+- a folder tree on the left and the current folder on the right, with
+  sortable Name / Size / Modified / Type columns, back / forward / up, an
+  editable path bar and a filter;
+- **drag files or folders from Explorer** into the window to upload them into
+  the folder you are viewing, or drop them on a folder to upload there;
+- **move** items by dragging them onto a folder (in the list or the tree), or
+  with Cut / Copy / Paste (Ctrl+X / C / V). Moves are server-side when the FTP
+  server allows it, otherwise they go through the PC;
+- inline rename (F2), new folder, recursive download / upload / delete, a
+  right-click menu, and "Open on this PC";
+- a transfer queue with percentage, rate, time left and **Cancel**. Transfers
+  use their own FTP connection, so browsing keeps working meanwhile.
 
 Throughput is better than the nominal 115200 baud suggests, because a USB CDC
 gadget ignores that figure and runs at USB speed. Measured here at about
@@ -492,10 +507,13 @@ corrupts it. `RELAY` is what the proxy uses.
 
 ```text
 pc/
-  civswitch_gui.py     PC GUI: bridge, payloads, commands, tunnel, file browser
+  civswitch_gui.py     PC GUI: bridge, payloads, commands, tunnel, Files tab
+  ftp_browser.py       the Files tab: two-pane FTP file manager
+  ftp_client.py        minimal FTP over SOCKS, also usable standalone
+  pilink.py            clean shutdown helpers shared by the GUI and tunnels
+  win_drop.py          drag and drop from Explorer, high-DPI support
   tcp_proxy.py         one-shot TCP-to-serial relay for npm tools
   socks_tunnel.py      SOCKS5 proxy over a multiplexed serial tunnel
-  ftp_client.py        minimal FTP over SOCKS, also usable standalone
   requirements.txt
 pi/
   supervisor.py        systemd service: serial protocol, mode control

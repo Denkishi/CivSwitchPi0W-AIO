@@ -5,28 +5,41 @@ One window for everything the Pi does: bridge control, sending JS payloads,
 raw protocol commands, a tunnel for console tools, and a file browser for the
 console's SD card.
 
+Threading rules (these are what keep the window from freezing or crashing):
+  * The Tk main thread never does serial, socket or process I/O that can
+    block. All of it runs on worker threads.
+  * Worker threads never touch Tk. They post callbacks to self._q, which the
+    main thread drains every 30 ms (self._ui()).
+
 Requires: pip install pyserial
 """
 
+import faulthandler
 import json
 import os
+import queue
+import socket
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 import serial
 import serial.tools.list_ports
 
-import ftp_client
+import ftp_browser
+import pilink
+import win_drop
 
 BAUD = 115200
 DEFAULT_IP = "192.168.4.2"
 DEFAULT_PORT = "9026"
 FTP_PORT = "1337"
 SOCKS_PORT = 1080
+INSTANCE_PORT = 47826       # localhost port held while the GUI runs
 
 # Linux Foundation / Gadget Serial -- what g_serial presents on the Pi.
 GADGET = (0x0525, 0xA4A7)
@@ -34,6 +47,7 @@ GADGET = (0x0525, 0xA4A7)
 HERE = os.path.dirname(os.path.abspath(__file__))
 TCP_PROXY = os.path.join(HERE, "tcp_proxy.py")
 SOCKS_TUNNEL = os.path.join(HERE, "socks_tunnel.py")
+LOG_FILE = os.path.join(HERE, "civswitch_gui.log")
 
 # Both tunnels need the COM port to themselves, so only one runs at a time.
 TUNNELS = {
@@ -41,33 +55,213 @@ TUNNELS = {
     "SOCKS5 (for FTP and browsers)": SOCKS_TUNNEL,
 }
 
+# Supervisor lines that mean a BRIDGE/STOP command has finished. While one is
+# running the Pi does not read the serial port at all (it can take minutes),
+# so the GUI must not pile up more commands behind it.
+DONE_MARKERS = ("Bridge mode active", "Bridge failed", "All stopped")
+BUSY_MARKERS = {"Autostarting bridge": "start"}
+PENDING_TIMEOUT = 150
+LOG_LINES = 3000
+
 PAD = 8
+
+
+def _diag(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    except Exception:
+        pass
+
+
+class SerialLink:
+    """Owns one open COM port: a reader thread and a writer thread.
+
+    Writes are queued, so a Pi that is busy (and not reading) can never stall
+    the UI. shutdown() blocks and must be called from a worker thread.
+    """
+
+    def __init__(self, dev):
+        self.dev = dev
+        self.ser = serial.Serial(dev, BAUD, timeout=0.2, write_timeout=5)
+        self.stop = threading.Event()
+        self.wq = queue.Queue()
+        self._rt = self._wt = None
+
+    def start(self, on_line, on_lost, on_note):
+        self.on_line, self.on_lost, self.on_note = on_line, on_lost, on_note
+        self._rt = threading.Thread(target=self._reader, daemon=True)
+        self._wt = threading.Thread(target=self._writer, daemon=True)
+        self._rt.start()
+        self._wt.start()
+
+    def send(self, *parts):
+        """Queue bytes to write; a float in parts is a pause in seconds."""
+        if not self.stop.is_set():
+            self.wq.put(parts)
+
+    def _writer(self):
+        while True:
+            job = self.wq.get()
+            if job is None or self.stop.is_set():
+                return
+            try:
+                for p in job:
+                    if isinstance(p, float):
+                        time.sleep(p)
+                    else:
+                        self.ser.write(p)
+            except serial.SerialTimeoutException:
+                self.on_note("write timed out: the Pi is not reading "
+                             "(still busy with the previous command?)")
+            except Exception as e:
+                if not self.stop.is_set():
+                    self.on_lost(f"serial write failed: {e}")
+                return
+
+    def _reader(self):
+        buf = b""
+        while not self.stop.is_set():
+            try:
+                chunk = self.ser.read(self.ser.in_waiting or 1)
+            except Exception as e:
+                if not self.stop.is_set():
+                    self.on_lost(f"serial lost: {e}")
+                return
+            if not chunk:
+                continue
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace").strip()
+                if line and line != "END":
+                    self.on_line(line)
+            if len(buf) > 65536:
+                buf = b""
+
+    def shutdown(self, stop_bridge=False, log=None):
+        self.stop.set()
+        self.wq.put(None)
+        for name in ("cancel_write", "cancel_read"):
+            try:
+                getattr(self.ser, name)()
+            except Exception:
+                pass
+        for t in (self._rt, self._wt):
+            if t and t is not threading.current_thread():
+                t.join(1.5)
+        mode = None
+        if stop_bridge:
+            try:
+                mode = pilink.stop_bridge(self.ser, log=log)
+            except Exception as e:
+                if log:
+                    log(f"stop bridge failed: {e}")
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        return mode
+
+
+def end_child(proc, cmd, wait):
+    """Ask a tunnel process to exit; escalate if it does not. Blocking.
+
+    Returns True if it exited on its own (so it ran its own cleanup).
+    """
+    try:
+        proc.stdin.write(cmd + "\n")
+        proc.stdin.flush()
+    except Exception:
+        pass
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=wait)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+    return False
 
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title("CivSwitch Bridge")
-        root.geometry("680x760")
-        root.minsize(600, 620)
+        # Sizes are in pixels; scale them for high-DPI screens.
+        k = max(1.0, root.winfo_fpixels("1i") / 96.0)
+        root.geometry(f"{int(820 * k)}x{int(820 * k)}")
+        root.minsize(int(680 * k), int(640 * k))
 
-        self.ser = None
+        self._q = queue.Queue()
+        self.link = None            # SerialLink while we own the COM port
+        self._link_busy = False     # opening or closing a port
         self.mode = "?"
+        self.pending = None         # "start" | "stop" while the Pi is busy
+        self.pending_deadline = 0.0
+        self.infos_out = 0          # INFOs sent and not yet answered
+        self.info_sent = 0.0        # when the last INFO went out
+        self._poll_gen = 0
         self.ports = []
-        self.proxy = None          # Popen while a tunnel owns the COM port
-        self.ftp = None
-        # One control connection, so one operation at a time. Letting two
-        # buttons overlap desynced it: the second command landed mid-transfer
-        # and the server answered "503 Invalid command during transfer", then
-        # reset the connection, which left Up and Refresh dead.
-        self.ftp_lock = threading.Lock()
-        self.cwd = "/"
-        self.entries = []
-        self._stop = threading.Event()
+        self.proxy = None           # Popen while a tunnel owns the COM port
+        self._proxy_busy = False
+        self.proxy_socks = False    # the running tunnel is the SOCKS one
+        self.socks_ready = False    # ...and it is accepting connections
+        self._closing = False
 
         ttk.Style().theme_use("clam")
         self._build()
+        root.report_callback_exception = self._tk_error
+        self._drain()
         self._scan_ports()
+        # Files dragged in from Explorer. The window procedure only queues
+        # them; the main loop handles them.
+        win_drop.enable(root, lambda paths, pt: self._ui(self._on_os_drop,
+                                                        paths, pt))
+
+    # -- thread hand-off ------------------------------------------
+    def _ui(self, fn, *args):
+        """Run fn(*args) on the Tk thread. Safe from any thread."""
+        self._q.put((fn, args))
+
+    def _drain(self):
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            try:
+                fn, args = self._q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception:
+                self._tk_error(*sys.exc_info())
+        try:
+            self.root.after(30, self._drain)
+        except tk.TclError:
+            pass
+
+    def _tk_error(self, exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        _diag(text)
+        try:
+            self._say(f"internal error: {val} (details in {os.path.basename(LOG_FILE)})",
+                      "err")
+        except Exception:
+            pass
+
+    def _bg(self, fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True).start()
 
     # -- layout ---------------------------------------------------
     def _build(self):
@@ -79,8 +273,9 @@ class App:
         self.port_box = ttk.Combobox(bar, textvariable=self.port, width=22,
                                      state="readonly")
         self.port_box.pack(side=tk.LEFT)
-        ttk.Button(bar, text="↻", width=3,
-                   command=self._scan_ports).pack(side=tk.LEFT, padx=4)
+        self.scan_btn = ttk.Button(bar, text="↻", width=3,
+                                   command=self._scan_ports)
+        self.scan_btn.pack(side=tk.LEFT, padx=4)
         self.conn_btn = ttk.Button(bar, text="Connect", command=self._toggle_conn)
         self.conn_btn.pack(side=tk.LEFT, padx=4)
         self.state_lbl = ttk.Label(bar, text="● not connected",
@@ -95,8 +290,16 @@ class App:
         self.bridge_btn.pack(side=tk.LEFT)
         self.info_lbl = ttk.Label(bridge, text="")
         self.info_lbl.pack(side=tk.LEFT, padx=PAD)
+        self.stop_on_exit = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bridge, text="Stop bridge on exit",
+                        variable=self.stop_on_exit).pack(side=tk.RIGHT)
 
-        box = ttk.LabelFrame(root, text="Payload", padding=PAD)
+        self.tabs = ttk.Notebook(root)
+        self.tabs.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=(PAD, 0))
+        tab = ttk.Frame(self.tabs, padding=(0, 0, 0, PAD))
+        self.tabs.add(tab, text="  Bridge  ")
+
+        box = ttk.LabelFrame(tab, text="Payload", padding=PAD)
         box.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
         row = ttk.Frame(box)
         row.pack(fill=tk.X)
@@ -118,7 +321,7 @@ class App:
         self.send_btn.pack(side=tk.LEFT)
 
         # A tunnel takes the COM port off us while it runs.
-        tbox = ttk.LabelFrame(root, text="Tunnel", padding=PAD)
+        tbox = ttk.LabelFrame(tab, text="Tunnel", padding=PAD)
         tbox.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
         trow = ttk.Frame(tbox)
         trow.pack(fill=tk.X)
@@ -132,7 +335,7 @@ class App:
         ttk.Label(trow, text="port").pack(side=tk.LEFT, padx=(6, 2))
         self.tunnel_port = tk.StringVar(value=DEFAULT_PORT)
         self.tunnel_port_combo = ttk.Combobox(trow, textvariable=self.tunnel_port,
-                                             values=["9026", "8080"], width=6)
+                                              values=["9026", "8080"], width=6)
         self.tunnel_port_combo.pack(side=tk.LEFT, padx=2)
 
         self.proxy_btn = ttk.Button(trow, text="Start", command=self._toggle_proxy)
@@ -140,47 +343,7 @@ class App:
         self.proxy_lbl = ttk.Label(trow, text="stopped", foreground="#888")
         self.proxy_lbl.pack(side=tk.LEFT, padx=PAD)
 
-        # FTP browser. Needs the SOCKS tunnel, since it reaches the console
-        # through it rather than over a network the PC does not have.
-        fbox = ttk.LabelFrame(root, text="Console files (FTP over SOCKS)",
-                              padding=PAD)
-        fbox.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=(PAD, 0))
-        frow = ttk.Frame(fbox)
-        frow.pack(fill=tk.X)
-        self.ftp_port = tk.StringVar(value=FTP_PORT)
-        ttk.Label(frow, text="port").pack(side=tk.LEFT)
-        ttk.Entry(frow, textvariable=self.ftp_port, width=7).pack(side=tk.LEFT, padx=4)
-        self.ftp_btn = ttk.Button(frow, text="Connect", command=self._toggle_ftp)
-        self.ftp_btn.pack(side=tk.LEFT, padx=4)
-        self.path_lbl = ttk.Label(frow, text="", foreground="#555")
-        self.path_lbl.pack(side=tk.LEFT, padx=PAD)
-
-        self.listbox = tk.Listbox(fbox, height=9, font=("Consolas", 9),
-                                  activestyle="none")
-        self.listbox.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        self.listbox.bind("<Double-Button-1>", lambda _e: self._ftp_open())
-
-        brow = ttk.Frame(fbox)
-        brow.pack(fill=tk.X, pady=(6, 0))
-        self.ftp_buttons = []
-        for text, cmd in (("Open", self._ftp_open), ("Up", self._ftp_up),
-                          ("Refresh", self._ftp_refresh),
-                          ("Download", self._ftp_download),
-                          ("Upload", self._ftp_upload),
-                          ("Delete", self._ftp_delete)):
-            b = ttk.Button(brow, text=text, command=cmd, state=tk.DISABLED)
-            b.pack(side=tk.LEFT, padx=(0, 4))
-            self.ftp_buttons.append(b)
-
-        prow = ttk.Frame(fbox)
-        prow.pack(fill=tk.X, pady=(6, 0))
-        self.prog = ttk.Progressbar(prow, mode="determinate", maximum=1000)
-        self.prog.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.prog_lbl = ttk.Label(prow, text="", width=34, anchor=tk.W,
-                                  foreground="#555")
-        self.prog_lbl.pack(side=tk.LEFT, padx=(6, 0))
-
-        cmd = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
+        cmd = ttk.Frame(tab, padding=(PAD, PAD, PAD, 0))
         cmd.pack(fill=tk.X)
         ttk.Label(cmd, text="❯").pack(side=tk.LEFT)
         self.cmd = tk.StringVar()
@@ -191,10 +354,13 @@ class App:
                                   state=tk.DISABLED)
         self.cmd_btn.pack(side=tk.LEFT)
 
-        self.log = scrolledtext.ScrolledText(root, height=9, wrap=tk.WORD,
+        self.browser = ftp_browser.FileBrowser(self.tabs, self)
+        self.tabs.add(self.browser, text="  Files  ")
+
+        self.log = scrolledtext.ScrolledText(root, height=7, wrap=tk.WORD,
                                              font=("Consolas", 9),
                                              state=tk.DISABLED, relief=tk.FLAT)
-        self.log.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=PAD)
+        self.log.pack(fill=tk.X, padx=PAD, pady=PAD)
         self.log.tag_configure("err", foreground="#b33")
         self.log.tag_configure("dim", foreground="#888")
         self.log.tag_configure("me", foreground="#36c")
@@ -219,80 +385,141 @@ class App:
 
     def _selected_port(self):
         i = self.port_box.current()
-        return self.ports[i].device if i >= 0 else None
+        return self.ports[i].device if 0 <= i < len(self.ports) else None
 
     # -- connection -----------------------------------------------
     def _toggle_conn(self):
-        self._disconnect() if self.ser else self._connect()
+        if self._link_busy:
+            return
+        self._disconnect() if self.link else self._connect()
 
     def _connect(self):
-        if self.proxy:
+        if self.proxy or self._proxy_busy:
             self._say("A tunnel holds the port. Stop it first.", "err")
+            return
+        if self.link or self._link_busy or self._closing:
             return
         dev = self._selected_port()
         if not dev:
             self._say("Select a port.", "err")
             return
-        try:
-            self.ser = serial.Serial(dev, BAUD, timeout=0.2, write_timeout=15)
-        except Exception as e:
-            # A serial port takes a single reader, and "Access is denied" says
-            # nothing about who has it. Name the usual suspects instead.
-            if isinstance(e, PermissionError) or "ermission" in str(e)                     or "ccesso negato" in str(e):
-                self._say(f"{dev} is held by another process. Close a running "
-                          f"tunnel (socks_tunnel.py / tcp_proxy.py), another "
-                          f"copy of this GUI, or a serial terminal.", "err")
-            else:
-                self._say(str(e), "err")
-            return
-        self._stop.clear()
-        threading.Thread(target=self._reader, daemon=True).start()
-        self.conn_btn.config(text="Disconnect")
-        for w in (self.bridge_btn, self.cmd_entry, self.cmd_btn):
-            w.config(state=tk.NORMAL)
-        self._say(f"connected to {dev}", "dim")
-        self.root.after(400, self._poll)
+        self._link_busy = True
+        self.conn_btn.config(state=tk.DISABLED, text="Connecting…")
+        self._status("connecting…", "#555")
 
-    def _disconnect(self):
-        self._stop.set()
-        try:
-            self.ser.close()
-        except Exception:
-            pass
-        self.ser = None
+        def work():
+            try:
+                link = SerialLink(dev)
+            except Exception as e:
+                self._ui(self._connect_failed, dev, e)
+                return
+            self._ui(self._connected, link)
+        self._bg(work)
+
+    def _connect_failed(self, dev, e):
+        self._link_busy = False
+        self.conn_btn.config(state=tk.NORMAL, text="Connect")
+        self._status("not connected", "#b33")
+        # A serial port takes a single reader, and "Access is denied" says
+        # nothing about who has it. Name the usual suspects instead.
+        if isinstance(e, PermissionError) or "ermission" in str(e) \
+                or "ccesso negato" in str(e) or "denied" in str(e):
+            self._say(f"{dev} is held by another process: a tunnel left running "
+                      f"(python socks_tunnel.py / tcp_proxy.py), another copy of "
+                      f"this GUI, or a serial terminal. Unplugging and replugging "
+                      f"the Pi frees it.", "err")
+        else:
+            self._say(str(e), "err")
+
+    def _connected(self, link):
+        self._link_busy = False
+        if self._closing:
+            self._bg(link.shutdown)
+            return
+        self.link = link
         self.mode = "?"
-        self.conn_btn.config(text="Connect")
-        self.bridge_btn.config(state=tk.DISABLED, text="Start bridge")
+        self.pending = None
+        self.infos_out = 0
+        link.start(
+            on_line=lambda line: self._ui(self._on_line, link, line),
+            on_lost=lambda msg: self._ui(self._link_lost, link, msg),
+            on_note=lambda msg: self._ui(self._say, msg, "dim"),
+        )
+        self.conn_btn.config(state=tk.NORMAL, text="Disconnect")
+        for w in (self.cmd_entry, self.cmd_btn):
+            w.config(state=tk.NORMAL)
+        self._status("connected", "#555")
+        self.info_lbl.config(text="waiting for status…")
+        self._refresh_controls()
+        self._say(f"connected to {link.dev}", "dim")
+        self._poll_gen += 1
+        self.root.after(300, self._poll, self._poll_gen)
+
+    def _link_lost(self, link, msg):
+        if link is not self.link:
+            return
+        self._say(msg, "err")
+        self._disconnect()
+
+    def _disconnect(self, then=None, stop_bridge=False):
+        """Release the port. `then` runs on the UI thread once it is free."""
+        link, self.link = self.link, None
+        self._poll_gen += 1
+        self.mode = "?"
+        self.pending = None
+        self.infos_out = 0
         for w in (self.send_btn, self.cmd_entry, self.cmd_btn):
             w.config(state=tk.DISABLED)
         self.info_lbl.config(text="")
-        self._status("not connected", "#b33")
+        self._refresh_controls()
+        if not link:
+            self.conn_btn.config(state=tk.NORMAL, text="Connect")
+            self._status("not connected", "#b33")
+            if then:
+                then()
+            return
+        self._link_busy = True
+        self.conn_btn.config(state=tk.DISABLED, text="Closing…")
 
-    def _reader(self):
-        while not self._stop.is_set() and self.ser:
-            try:
-                raw = self.ser.readline()
-            except Exception:
-                if not self._stop.is_set():
-                    self.root.after(0, self._disconnect)
-                return
-            if not raw:
-                continue
-            line = raw.decode("utf-8", "replace").strip()
-            if line and line != "END":
-                try:
-                    self.root.after(0, self._on_line, line)
-                except RuntimeError:
-                    # Window already going away; after() needs the main loop.
-                    return
+        def work():
+            log = (lambda m: self._ui(self._say, m, "dim")) if stop_bridge else None
+            link.shutdown(stop_bridge=stop_bridge, log=log)
+            time.sleep(0.5)     # let Windows really release the handle
+            self._ui(self._disconnected, then)
+        self._bg(work)
 
-    def _on_line(self, line):
+    def _disconnected(self, then):
+        self._link_busy = False
+        self.conn_btn.config(state=tk.NORMAL if not self.proxy else tk.DISABLED,
+                             text="Connect")
+        if not self.proxy:
+            self._status("not connected", "#b33")
+        if then:
+            then()
+
+    def _on_line(self, link, line):
+        if link is not self.link:
+            return
         if line.startswith("{"):
             try:
-                self._apply_info(json.loads(line))
-                return
-            except (json.JSONDecodeError, KeyError):
+                info = json.loads(line)
+                if isinstance(info, dict) and "mode" in info:
+                    self.infos_out = max(0, self.infos_out - 1)
+                    # A BRIDGE/STOP is always followed by an INFO, and the Pi
+                    # answers in order: once every INFO is answered, the
+                    # command is done, even if its text marker was missed.
+                    if self.pending and self.infos_out == 0:
+                        self.pending = None
+                    self._apply_info(info)
+                    return
+            except ValueError:
                 pass
+        for marker, kind in BUSY_MARKERS.items():
+            if marker in line:
+                self._set_pending(kind)
+        if self.pending and any(m in line for m in DONE_MARKERS):
+            self.pending = None
+            self._refresh_controls()
         self._say(line, "err" if "[ERROR]" in line
                   or line.startswith("ERR") else None)
 
@@ -310,48 +537,95 @@ class App:
             # and no need for a static lease.
             parts.append(f"ssh pi@{lan_ip}")
         self.info_lbl.config(text="  ·  ".join(parts))
-
-        self.bridge_btn.config(text="Stop bridge" if bridging else "Start bridge")
-        self.send_btn.config(state=tk.NORMAL if bridging else tk.DISABLED)
+        self._refresh_controls()
+        if self.pending:
+            return
         if bridging:
             self._status(f"AP {info.get('ap_ip', '')}", "#2a7")
         else:
             self._status("connected", "#555")
 
-    def _poll(self):
-        if self.ser and not self.proxy:
-            self._write("INFO")
-            self.root.after(5000, self._poll)
+    def _set_pending(self, kind):
+        self.pending = kind
+        self.pending_deadline = time.monotonic() + PENDING_TIMEOUT
+        self._status("Pi busy…", "#c80")
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        """Bridge/Send buttons follow the link, the mode and any pending command."""
+        if not self.link:
+            self.bridge_btn.config(state=tk.DISABLED, text="Start bridge")
+            self.send_btn.config(state=tk.DISABLED)
+            return
+        if self.pending:
+            text = "Starting bridge…" if self.pending == "start" else "Stopping bridge…"
+            self.bridge_btn.config(state=tk.DISABLED, text=text)
+            self.send_btn.config(state=tk.DISABLED)
+            return
+        bridging = self.mode == "bridge"
+        # Unknown mode: wait for the first INFO. Sending BRIDGE while the Pi
+        # is already bridging makes it tear everything down first (minutes).
+        self.bridge_btn.config(
+            state=tk.NORMAL if self.mode != "?" else tk.DISABLED,
+            text="Stop bridge" if bridging else "Start bridge")
+        self.send_btn.config(state=tk.NORMAL if bridging else tk.DISABLED)
+
+    def _command(self, line, pending=None):
+        """Send a line command; BRIDGE/STOP get an INFO queued right behind."""
+        if not self.link:
+            return
+        data = (line + "\n").encode()
+        if pending:
+            self._set_pending(pending)
+            data += b"INFO\n"
+            self.infos_out += 1
+            self.info_sent = time.monotonic()
+        self.link.send(data)
+
+    def _ask_info(self):
+        if self.link and not self.pending:
+            self.infos_out += 1
+            self.info_sent = time.monotonic()
+            self.link.send(b"INFO\n")
+
+    def _poll(self, gen):
+        if gen != self._poll_gen or not self.link or self._closing:
+            return
+        now = time.monotonic()
+        if self.pending and now > self.pending_deadline:
+            self._say("the Pi did not report back; asking for status again", "err")
+            self.pending = None
+            self.infos_out = 0
+            self._refresh_controls()
+        if not self.pending:
+            # Never stack INFOs behind unanswered ones -- except while the
+            # mode is still unknown: a Pi left in tunnel mode eats the first
+            # line, so keep asking every couple of seconds until it answers.
+            stale = 2.5 if self.mode == "?" else 30
+            if not self.infos_out or now - self.info_sent > stale:
+                self.infos_out = 0
+                self._ask_info()
+        self.root.after(2500 if self.mode == "?" else 5000, self._poll, gen)
 
     # -- commands -------------------------------------------------
-    def _write(self, cmd, payload=None):
-        if not self.ser:
-            self._say("Not connected.", "err")
-            return
-        try:
-            self.ser.write((cmd + "\n").encode())
-            if payload:
-                time.sleep(0.1)
-                self.ser.write(payload)
-            self.ser.flush()
-        except Exception as e:
-            self._say(str(e), "err")
-
     def _send_cmd(self):
         line = self.cmd.get().strip()
-        if not line or not self.ser:
+        if not line or not self.link:
             return
         self._say(f"❯ {line}", "me")
-        self._write(line)
+        # The Pi matches commands exactly (case-sensitive).
+        self._command(line, {"BRIDGE": "start", "STOP": "stop"}.get(line))
         self.cmd.set("")
 
     def _toggle_bridge(self):
+        if not self.link or self.pending or self.mode == "?":
+            return
         if self.mode == "bridge":
-            self._say("stopping bridge...", "dim")
-            self._write("STOP")
+            self._say("stopping bridge (this can take a minute)…", "dim")
+            self._command("STOP", "stop")
         else:
-            self._say("starting bridge...", "dim")
-            self._write("BRIDGE")
+            self._say("starting bridge (up to ~30 s)…", "dim")
+            self._command("BRIDGE", "start")
 
     def _pick(self):
         path = filedialog.askopenfilename(
@@ -360,6 +634,8 @@ class App:
             self.file.set(path)
 
     def _send(self):
+        if not self.link:
+            return
         path = self.file.get()
         if not os.path.isfile(path):
             self._say("Pick a payload file.", "err")
@@ -376,7 +652,8 @@ class App:
             self._say(str(e), "err")
             return
         self._say(f"sending {len(data)} bytes to {self.ip.get()}:{port}", "dim")
-        self._write(f"SEND {self.ip.get()} {port} {len(data)}", data)
+        self.link.send(f"SEND {self.ip.get()} {port} {len(data)}\n".encode(),
+                       0.1, data)
 
     # -- tunnel ---------------------------------------------------
     def _on_tunnel_kind_changed(self, _event=None):
@@ -390,6 +667,8 @@ class App:
                 self.tunnel_port.set(self.tcp.get() or DEFAULT_PORT)
 
     def _toggle_proxy(self):
+        if self._proxy_busy:
+            return
         self._stop_proxy() if self.proxy else self._start_proxy()
 
     def _start_proxy(self):
@@ -402,8 +681,9 @@ class App:
             self._say(f"{os.path.basename(script)} not found next to this file.",
                       "err")
             return
-        if self.mode != "bridge":
-            self._say("Start the bridge first: the relay needs it.", "err")
+        if self.mode != "bridge" or self.pending:
+            self._say("Start the bridge first (and wait for it): the tunnel "
+                      "needs it.", "err")
             return
 
         port_str = self.tunnel_port.get().strip()
@@ -415,336 +695,268 @@ class App:
             self._say("Invalid tunnel port (1-65535).", "err")
             return
 
-        # One reader per COM port, so give ours up before the tunnel opens it.
-        if self.ser:
-            self._say("releasing the port for the tunnel", "dim")
-            self._disconnect()
-            time.sleep(0.8)
-
         socks = script == SOCKS_TUNNEL
         cmd = [sys.executable, "-u", script, "--port", dev, "--console",
-               self.ip.get(), "--listen-port", str(port_num)]
+               self.ip.get(), "--listen-port", str(port_num), "--parent-watch"]
         if not socks:
             cmd += ["--console-port", str(port_num)]
+
+        self._proxy_busy = True
+        self.proxy_btn.config(state=tk.DISABLED, text="Starting…")
+        self.tunnel_combo.config(state=tk.DISABLED)
+        # One reader per COM port, so give ours up before the tunnel opens it.
+        self._say("releasing the port for the tunnel", "dim")
+        self._disconnect(then=lambda: self._launch_proxy(cmd, socks, port_num))
+
+    def _launch_proxy(self, cmd, socks, port_num):
+        if self._closing:
+            self._proxy_busy = False
+            return
         try:
-            self.proxy = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+            # stdin is the lifeline: the tunnel exits cleanly when we write
+            # "quit"/"stop" or when this process dies and the pipe closes.
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception as e:
-            self.proxy = None
+            self._proxy_busy = False
+            self.proxy_btn.config(state=tk.NORMAL, text="Start")
+            self.tunnel_combo.config(state="readonly")
             self._say(str(e), "err")
             return
-
-        threading.Thread(target=self._proxy_reader, daemon=True).start()
-        self.proxy_btn.config(text="Stop")
+        self.proxy = proc
+        self.proxy_socks = socks
+        self.socks_ready = False
+        self._proxy_busy = False
+        self._bg(self._proxy_reader, proc)
+        self.proxy_btn.config(state=tk.NORMAL, text="Stop")
         self.conn_btn.config(state=tk.DISABLED)
-        where = f"127.0.0.1:{port_num}"
-        self.proxy_lbl.config(text=f"running · {where}", foreground="#2a7")
+        self.proxy_lbl.config(text=f"running · 127.0.0.1:{port_num}",
+                              foreground="#2a7")
         self._status("tunnel running", "#2a7")
-        if socks:
-            self.ftp_btn.config(state=tk.NORMAL)
 
-    def _proxy_reader(self):
-        proc = self.proxy
+    def _proxy_reader(self, proc):
         try:
             for line in proc.stdout:
                 line = line.rstrip()
                 if line:
-                    try:
-                        self.root.after(0, self._say, f"[tunnel] {line}", "dim")
-                    except RuntimeError:
-                        return
+                    self._ui(self._tunnel_line, proc, line)
         except Exception:
             pass
         try:
-            self.root.after(0, self._proxy_ended)
-        except RuntimeError:
+            proc.wait(timeout=10)
+        except Exception:
             pass
+        self._ui(self._proxy_ended, proc)
 
-    def _proxy_ended(self):
-        if self.proxy:
-            self._say("[tunnel] stopped", "dim")
+    def _proxy_ended(self, proc):
+        if proc is not self.proxy:
+            return          # an older process; the current one is unaffected
         self.proxy = None
-        self.proxy_btn.config(text="Start")
-        self.conn_btn.config(state=tk.NORMAL)
+        self._proxy_busy = False
+        self._say(f"[tunnel] stopped (exit code {proc.returncode})", "dim")
+        self.proxy_btn.config(state=tk.NORMAL, text="Start")
+        self.tunnel_combo.config(state="readonly")
         self.proxy_lbl.config(text="stopped", foreground="#888")
+        self.socks_ready = False
+        self.browser.tunnel_down()
+        self.conn_btn.config(state=tk.NORMAL, text="Connect")
         self._status("not connected", "#b33")
-        self._ftp_disconnect()
-        self.ftp_btn.config(state=tk.DISABLED)
+        if not self._closing:
+            # Take the port back so the status and bridge controls work again.
+            self.root.after(800, self._connect)
+
+    def _on_os_drop(self, paths, point):
+        """Files dropped on the window from Explorer."""
+        if not paths or self._closing:
+            return
+        on_bridge_tab = self.tabs.select() != str(self.browser)
+        if on_bridge_tab and len(paths) == 1 and paths[0].lower().endswith(".js") \
+                and os.path.isfile(paths[0]):
+            self.file.set(paths[0])
+            self._say(f"payload set to {paths[0]}", "dim")
+            return
+        if on_bridge_tab:
+            self.tabs.select(self.browser)
+            point = None            # the pointer was over the Bridge tab
+        self.browser.handle_drop(paths, point)
+
+    def _tunnel_line(self, proc, line):
+        if proc is self.proxy and self.proxy_socks and "SOCKS5 on" in line:
+            self.socks_ready = True
+        self._say(f"[tunnel] {line}", "dim")
+
+    # -- hooks for the Files tab ----------------------------------
+    def browser_target(self):
+        """(console IP, local SOCKS port) for the FTP sessions."""
+        s = self.tunnel_port.get().strip()
+        return self.ip.get().strip(), int(s) if s.isdigit() else SOCKS_PORT
+
+    def browser_state(self):
+        if self.proxy:
+            if not self.proxy_socks:
+                return "other-tunnel"
+            return "ready" if self.socks_ready else "tunnel-starting"
+        if self._proxy_busy:
+            return "tunnel-starting"
+        if self.mode == "bridge" and not self.pending:
+            return "no-tunnel"
+        return "no-bridge"
+
+    def browser_start_socks(self):
+        if self.proxy or self._proxy_busy:
+            return
+        socks = next(k for k, v in TUNNELS.items() if v == SOCKS_TUNNEL)
+        self.tunnel_kind.set(socks)
+        self._on_tunnel_kind_changed()
+        self._start_proxy()
 
     def _stop_proxy(self):
-        self._ftp_disconnect()
-        proc, self.proxy = self.proxy, None
-        if proc:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        self._proxy_ended()
-
-    # -- FTP ------------------------------------------------------
-    def _toggle_ftp(self):
-        self._ftp_disconnect() if self.ftp else self._ftp_connect()
-
-    def _ftp_connect(self):
-        if not self.proxy or TUNNELS[self.tunnel_kind.get()] != SOCKS_TUNNEL:
-            self._say("Start the SOCKS5 tunnel first.", "err")
+        proc = self.proxy
+        if not proc:
             return
-        try:
-            port = int(self.ftp_port.get())
-        except ValueError:
-            self._say("Invalid FTP port.", "err")
-            return
-        try:
-            s_port = int(self.tunnel_port.get().strip()) if self.tunnel_port.get().strip().isdigit() else SOCKS_PORT
-            self.ftp = ftp_client.Ftp(self.ip.get(), port,
-                                      ("127.0.0.1", s_port)).connect()
-        except Exception as e:
-            self.ftp = None
-            self._say(f"FTP: {e}", "err")
-            return
-        self.ftp_btn.config(text="Disconnect")
-        for b in self.ftp_buttons:
-            b.config(state=tk.NORMAL)
-        self._say(f"FTP connected to {self.ip.get()}:{port}", "dim")
-        self.cwd = "/"
-        self._ftp_refresh()
-
-    def _ftp_disconnect(self):
-        if self.ftp:
-            try:
-                self.ftp.close()
-            except Exception:
-                pass
-        self.ftp = None
-        self.ftp_btn.config(text="Connect")
-        for b in self.ftp_buttons:
-            b.config(state=tk.DISABLED)
-        self.listbox.delete(0, tk.END)
-        self.path_lbl.config(text="")
-
-    def _ftp_task(self, fn, *args):
-        """Run one FTP call off the UI thread; the link is slow."""
-        if not self.ftp:
-            return
-        if not self.ftp_lock.acquire(blocking=False):
-            self._say("FTP busy -- wait for the current operation.", "dim")
-            return
-        self._ftp_busy(True)
-
-        def work():
-            try:
-                fn(*args)
-            except Exception as e:
-                self.root.after(0, self._ftp_error, e)
-            finally:
-                self.ftp_lock.release()
-                try:
-                    self.root.after(0, self._ftp_busy, False)
-                except RuntimeError:
-                    pass
-        threading.Thread(target=work, daemon=True).start()
-
-    def _progress_start(self, what, total):
-        self._prog_total = total
-        self._prog_last = 0.0
-        self._prog_t0 = time.monotonic()
-        self.prog.config(mode="determinate" if total else "indeterminate")
-        self.prog["value"] = 0
-        self.prog_lbl.config(text=f"{what}…")
-        if not total:
-            self.prog.start(80)
-
-    def _progress_tick(self, done):
-        """Called from the worker thread; throttled so the UI stays alive."""
-        now = time.monotonic()
-        if now - self._prog_last < 0.15 and done != self._prog_total:
-            return
-        self._prog_last = now
-        rate = done / max(now - self._prog_t0, 0.001)
-        try:
-            self.root.after(0, self._progress_show, done, rate)
-        except RuntimeError:
-            pass
-
-    def _progress_show(self, done, rate):
-        total = self._prog_total
-        speed = f"{rate / 1024:,.0f} KB/s"
-        if total:
-            self.prog["value"] = min(1000, int(done * 1000 / total))
-            pct = done * 100 // total
-            self.prog_lbl.config(
-                text=f"{pct}%  {done:,} / {total:,} B  ·  {speed}")
-        else:
-            self.prog_lbl.config(text=f"{done:,} B  ·  {speed}")
-
-    def _progress_end(self, note=""):
-        try:
-            self.prog.stop()
-        except Exception:
-            pass
-        self.prog.config(mode="determinate")
-        self.prog["value"] = 1000 if note else 0
-        self.prog_lbl.config(text=note)
-
-    def _ftp_busy(self, busy):
-        state = tk.DISABLED if busy else tk.NORMAL
-        for b in self.ftp_buttons:
-            b.config(state=state)
-
-    def _ftp_error(self, exc):
-        self._say(f"FTP: {exc}", "err")
-        text = str(exc)
-        # A reset or a desynced control connection cannot be recovered by
-        # retrying: drop the session so the next click reconnects cleanly
-        # instead of failing in the same way forever.
-        fatal = isinstance(exc, (OSError, ConnectionError)) or             text.startswith("503") or "closed" in text or "timed out" in text
-        if fatal:
-            self._say("FTP session dropped; click Connect again.", "dim")
-            self._ftp_disconnect()
-
-    def _ftp_refresh(self):
-        if not self.ftp:
-            return
-        self._ftp_task(self._do_refresh)
-
-    def _do_refresh(self):
-        # Always CWD to where we think we are, then list with a bare LIST
-        # (the server rejects LIST with a path). Passing None listed the
-        # server's current directory instead, so Up changed the label and
-        # showed the same contents.
-        self.ftp.cwd(self.cwd)
-        entries = self.ftp.listdir()
-        entries.sort(key=lambda e: (not e[1], e[0].lower()))
-        self.root.after(0, self._show_entries, entries)
-
-    def _show_entries(self, entries):
-        self.entries = entries
-        self.listbox.delete(0, tk.END)
-        for name, is_dir, size in entries:
-            mark = "[dir] " if is_dir else "      "
-            tail = "" if is_dir else f"   {size:,} B"
-            self.listbox.insert(tk.END, f"{mark}{name}{tail}")
-        self.path_lbl.config(text=self.cwd)
-
-    def _selected_entry(self):
-        sel = self.listbox.curselection()
-        return self.entries[sel[0]] if sel else None
-
-    def _join(self, name):
-        return (self.cwd.rstrip("/") + "/" + name) if self.cwd != "/" else "/" + name
-
-    def _ftp_open(self):
-        entry = self._selected_entry()
-        if not entry:
-            return
-        name, is_dir, _ = entry
-        if not is_dir:
-            self._ftp_download()
-            return
-        self.cwd = self._join(name)
-        self._ftp_refresh()
-
-    def _ftp_up(self):
-        if self.cwd == "/":
-            return
-        self.cwd = self.cwd.rsplit("/", 1)[0] or "/"
-        self._ftp_refresh()
-
-    def _ftp_download(self):
-        entry = self._selected_entry()
-        if not entry or entry[1]:
-            self._say("Pick a file.", "err")
-            return
-        name, _, size = entry
-        local = filedialog.asksaveasfilename(initialfile=name)
-        if not local:
-            return
-        remote = self._join(name)
-        self._say(f"downloading {remote} ({size:,} B)", "dim")
-        self._progress_start(f"Downloading {name}", size)
-        self._ftp_task(self._do_download, remote, local)
-
-    def _do_download(self, remote, local):
-        try:
-            with open(local, "wb") as fh:
-                n = self.ftp.retrieve(remote, fh, progress=self._progress_tick)
-        except Exception:
-            self.root.after(0, self._progress_end, "failed")
-            raise
-        self.root.after(0, self._progress_end, f"done · {n:,} B")
-        self.root.after(0, self._say, f"saved {n:,} B to {local}", "dim")
-
-    def _ftp_upload(self):
-        local = filedialog.askopenfilename()
-        if not local:
-            return
-        remote = self._join(os.path.basename(local))
-        try:
-            total = os.path.getsize(local)
-        except OSError:
-            total = 0
-        self._say(f"uploading {local} -> {remote} ({total:,} B)", "dim")
-        self._progress_start(f"Uploading {os.path.basename(local)}", total)
-        self._ftp_task(self._do_upload, local, remote)
-
-    def _do_upload(self, local, remote):
-        try:
-            with open(local, "rb") as fh:
-                n = self.ftp.store(fh, remote, progress=self._progress_tick)
-        except Exception:
-            self.root.after(0, self._progress_end, "failed")
-            raise
-        self.root.after(0, self._progress_end, f"done · {n:,} B")
-        self.root.after(0, self._say, f"sent {n:,} B", "dim")
-        self.root.after(0, self._ftp_refresh)
-
-    def _ftp_delete(self):
-        entry = self._selected_entry()
-        if not entry:
-            return
-        name, is_dir, _ = entry
-        if not messagebox.askyesno("Delete", f"Delete {name} from the console?"):
-            return
-        remote = self._join(name)
-        self._ftp_task(self._do_delete, remote, is_dir)
-
-    def _do_delete(self, remote, is_dir):
-        if is_dir:
-            self.ftp.rmdir(remote)
-        else:
-            self.ftp.delete(remote)
-        self.root.after(0, self._say, f"deleted {remote}", "dim")
-        self.root.after(0, self._ftp_refresh)
+        self._proxy_busy = True
+        self.proxy_btn.config(state=tk.DISABLED, text="Stopping…")
+        self.browser.tunnel_down()
+        # "quit" ends the tunnel but leaves the bridge running.
+        self._bg(end_child, proc, "quit", 8)
 
     # -- output ---------------------------------------------------
     def _say(self, text, tag=None):
         self.log.config(state=tk.NORMAL)
         stamp = time.strftime("%H:%M:%S")
         self.log.insert(tk.END, f"{stamp}  {text}\n", tag or ())
+        # Keep the widget bounded; a long session used to slow everything down.
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > LOG_LINES:
+            self.log.delete("1.0", f"{lines - LOG_LINES}.0")
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
 
     def _status(self, text, color):
         self.state_lbl.config(text=f"● {text}", foreground=color)
 
+    # -- shutdown -------------------------------------------------
     def close(self):
-        self._ftp_disconnect()
-        if self.proxy:
-            self._stop_proxy()
-        if self.ser:
-            self._disconnect()
-        self.root.destroy()
+        """Hide at once, clean up off the UI thread, then go.
+
+        Order matters: the tunnel (if any) must let go of the COM port, and
+        the Pi is told to stop the bridge, before the process exits.
+        """
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        stop = bool(self.stop_on_exit.get())
+        proc, link = self.proxy, self.link
+        self.browser.shutdown()
+        self.link = None
+        self._poll_gen += 1
+        dev = self._selected_port()
+        i = self.port_box.current()
+        is_pi = 0 <= i < len(self.ports) and \
+            (self.ports[i].vid, self.ports[i].pid) == GADGET
+        idle = self.mode == "idle" and link is not None
+
+        def work():
+            try:
+                if proc:
+                    # "stop" makes the tunnel stop the bridge itself after
+                    # leaving tunnel mode, while it still owns the port.
+                    clean = end_child(proc, "stop" if stop else "quit", 15)
+                    if not clean and stop and dev:
+                        time.sleep(0.8)
+                        self._stop_bridge_on(dev)
+                elif link:
+                    link.shutdown(stop_bridge=stop and not idle, log=_diag)
+                elif stop and is_pi:
+                    # Not connected (or mid-connect): open the port just to
+                    # stop the bridge -- only if it really is the Pi, never
+                    # some other serial device.
+                    time.sleep(1.0)
+                    self._stop_bridge_on(dev)
+            except Exception:
+                _diag("close: " + traceback.format_exc())
+            finally:
+                self._ui(self._destroy)
+        self._bg(work)
+        # Never let a stuck driver keep the process alive.
+        self.root.after(30000, self._destroy)
+
+    @staticmethod
+    def _stop_bridge_on(dev):
+        try:
+            ser = serial.Serial(dev, BAUD, timeout=0.2, write_timeout=3)
+        except Exception as e:
+            _diag(f"close: could not reopen {dev} to stop the bridge: {e}")
+            return
+        try:
+            pilink.stop_bridge(ser, log=_diag)
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _destroy(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+def _single_instance():
+    """Hold a localhost port so a second copy cannot fight over the COM port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", INSTANCE_PORT))
+        s.listen(1)
+    except OSError:
+        s.close()
+        return None
+    return s
 
 
 def main():
+    try:
+        diag = open(LOG_FILE, "a", encoding="utf-8")
+        faulthandler.enable(file=diag)
+        if sys.stderr is None:          # pythonw has no console
+            sys.stderr = diag
+    except Exception:
+        pass
+
+    win_drop.make_dpi_aware()
+    lock = _single_instance()
+    if lock is None:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror("CivSwitch Bridge",
+                             "CivSwitch Bridge is already running.\n"
+                             "Only one copy can use the Pi's COM port.")
+        r.destroy()
+        return
+
     root = tk.Tk()
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.close)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        lock.close()
+        # Daemon threads stuck inside a serial driver call must not keep the
+        # process (and with it the COM port) alive after the window is gone.
+        try:
+            sys.stdout and sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 if __name__ == "__main__":

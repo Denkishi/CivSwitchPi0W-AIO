@@ -128,6 +128,14 @@ class Tunnel:
     def close_channel(self, channel, tell_peer=False):
         sock = self.channels.pop(channel, None)
         if sock:
+            # shutdown() first: _pump is blocked in recv() on this socket, and
+            # on Linux a bare close() from another thread does not release it
+            # -- no FIN goes out, so the console never saw the end of an
+            # upload, never sent "226", and the PC sat until its timeout.
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 sock.close()
             except Exception:
