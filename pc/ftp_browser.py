@@ -14,6 +14,7 @@ touch Tk -- they post callbacks through host._ui().
 
 import json
 import os
+import sys
 import queue
 import shutil
 import socket
@@ -36,7 +37,10 @@ TEXT_EXTS = {".txt", ".ini", ".json", ".cfg", ".conf", ".log", ".md", ".js",
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-BOOKMARK_FILE = os.path.join(_HERE, "civswitch_bookmarks.json")
+# Next to the .exe when frozen (where __file__ is a temp dir), else pc/.
+_APPDIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else _HERE
+BOOKMARK_FILE = os.path.join(_APPDIR, "civswitch_bookmarks.json")
 
 
 def _load_bookmarks():
@@ -1103,9 +1107,13 @@ class FileBrowser(ttk.Frame):
         self._pv_token += 1
         token = self._pv_token
         import io
-        buf = io.BytesIO()
 
         def job(ftp):
+            # The buffer must be created here, not above: a retried job (the
+            # data channel dropped mid-read) runs job again, and a shared
+            # buffer would keep the partial first read and append a full second
+            # copy -- garbled preview, and a corrupt file if you then Save.
+            buf = io.BytesIO()
             ftp.retrieve(path, buf, size=entry.size or None)
             data = buf.getvalue()
             self._ui(self._pv_render, token, path, entry, kind, data)
@@ -1133,6 +1141,9 @@ class FileBrowser(ttk.Frame):
             self.pv_img_lbl.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
             self.pv_edit.config(state=tk.DISABLED)
         else:
+            # Keep the raw bytes: editing must re-check that they are valid
+            # UTF-8 before letting a save re-encode them (see _edit_toggle).
+            self._pv_bytes = data
             text = data.decode("utf-8", "replace")
             self.pv_img_lbl.pack_forget()
             self.pv_text.config(state=tk.NORMAL)
@@ -1170,6 +1181,15 @@ class FileBrowser(ttk.Frame):
                 self._preview_selected()
             return
         if not self._pv_file:
+            return
+        # Refuse to edit anything that is not clean UTF-8: the preview used
+        # errors="replace", so saving would re-encode those U+FFFD stand-ins
+        # and silently corrupt a binary or Latin-1 file.
+        try:
+            getattr(self, "_pv_bytes", b"").decode("utf-8")
+        except UnicodeDecodeError:
+            self._say("This file is not UTF-8 text; edit it after "
+                      "downloading instead.", "err")
             return
         self._editing = True
         self.pv_edit.config(text="Cancel")

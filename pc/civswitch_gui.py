@@ -31,6 +31,7 @@ import serial
 import serial.tools.list_ports
 
 import ftp_browser
+import pi_tab
 import gui_extras
 import payload_tab
 import pilink
@@ -49,8 +50,14 @@ GADGET = (0x0525, 0xA4A7)
 HERE = os.path.dirname(os.path.abspath(__file__))
 TCP_PROXY = os.path.join(HERE, "tcp_proxy.py")
 SOCKS_TUNNEL = os.path.join(HERE, "socks_tunnel.py")
-LOG_FILE = os.path.join(HERE, "civswitch_gui.log")
-PREFS_FILE = os.path.join(HERE, "civswitch_prefs.json")
+
+# When bundled by PyInstaller, __file__ lives in a throwaway temp dir, so
+# settings and logs must go next to the .exe instead -- otherwise they vanish
+# on exit. Running from source, that is just the pc/ folder.
+FROZEN = getattr(sys, "frozen", False)
+APPDIR = os.path.dirname(sys.executable) if FROZEN else HERE
+LOG_FILE = os.path.join(APPDIR, "civswitch_gui.log")
+PREFS_FILE = os.path.join(APPDIR, "civswitch_prefs.json")
 
 
 def _load_pref(key, default):
@@ -262,6 +269,7 @@ class App:
         win_drop.enable(root, lambda paths, pt: self._ui(self._on_os_drop,
                                                         paths, pt))
         self.root.after(1500, self._watch_ports)
+        self.root.after(5000, self._pi_auto)
 
     # -- thread hand-off ------------------------------------------
     def _ui(self, fn, *args):
@@ -396,6 +404,9 @@ class App:
         self.payload = payload_tab.PayloadTab(self.tabs, self)
         self.tabs.add(self.payload, text="  Payload  ")
 
+        self.pi = pi_tab.PiTab(self.tabs, self)
+        self.tabs.add(self.pi, text="  Pi  ")
+
         self.log = scrolledtext.ScrolledText(root, height=7, wrap=tk.WORD,
                                              font=("Consolas", 9),
                                              state=tk.DISABLED, relief=tk.FLAT)
@@ -502,6 +513,8 @@ class App:
         self._say(f"connected to {link.dev}", "dim")
         self._poll_gen += 1
         self.root.after(300, self._poll, self._poll_gen)
+        if hasattr(self, "pi"):
+            self.pi.on_connect(True)
 
     def _link_lost(self, link, msg):
         if link is not self.link:
@@ -520,6 +533,8 @@ class App:
             w.config(state=tk.DISABLED)
         self.info_lbl.config(text="")
         self._refresh_controls()
+        if hasattr(self, "pi"):
+            self.pi.on_connect(False)
         if not link:
             self.conn_btn.config(state=tk.NORMAL, text="Connect")
             self._status("not connected", "#b33")
@@ -551,6 +566,12 @@ class App:
         if line.startswith("{"):
             try:
                 info = json.loads(line)
+                if isinstance(info, dict) and "ts" in info and "files" in info:
+                    # A DIAG blob, not an INFO: it carries a timestamp and the
+                    # file-version map. Route it to the Pi tab and stop.
+                    if hasattr(self, "pi"):
+                        self.pi.on_diag(info)
+                    return
                 if isinstance(info, dict) and "mode" in info:
                     self.infos_out = max(0, self.infos_out - 1)
                     # A BRIDGE/STOP is always followed by an INFO, and the Pi
@@ -749,8 +770,14 @@ class App:
             return
 
         socks = script == SOCKS_TUNNEL
-        cmd = [sys.executable, "-u", script, "--port", dev, "--console",
-               self.ip.get(), "--listen-port", str(port_num), "--parent-watch"]
+        if FROZEN:
+            # No python and no .py on disk: re-launch our own .exe in tunnel
+            # mode (handled at the top of main()).
+            cmd = [sys.executable, "--run-tunnel", "socks" if socks else "tcp"]
+        else:
+            cmd = [sys.executable, "-u", script]
+        cmd += ["--port", dev, "--console", self.ip.get(),
+                "--listen-port", str(port_num), "--parent-watch"]
         if not socks:
             cmd += ["--console-port", str(port_num)]
 
@@ -886,6 +913,81 @@ class App:
         self.link.send(f"SEND {ip} {port} {len(data)}\n".encode(), 0.1, data)
         return True
 
+    # -- hooks for the Pi tab -------------------------------------
+    def pi_connected(self):
+        return bool(self.link)
+
+    def local_pi_hashes(self):
+        """{name: sha256[:12]} for the pi/*.py files this GUI ships, so the Pi
+        tab can show which of the Pi's files are out of date."""
+        import hashlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        pidir = os.path.join(os.path.dirname(here), "pi")
+        out = {}
+        for name in ("supervisor.py", "tunnel.py", "bridge_mode.py"):
+            try:
+                data = open(os.path.join(pidir, name), "rb").read()
+                out[name] = hashlib.sha256(data).hexdigest()[:12]
+            except Exception:
+                pass
+        return out
+
+    def pi_refresh(self):
+        """Ask the Pi for a diagnostics blob, if the link is free."""
+        if self.link and not self.pending and not self.proxy:
+            self.link.send(b"DIAG\n")
+
+    def _pi_auto(self):
+        """Poll DIAG every 5 s while the Pi tab is the visible one."""
+        self.root.after(5000, self._pi_auto)
+        if self._closing or not self.link:
+            return
+        try:
+            on_pi = self.tabs.tabs()[self.tabs.index("current")] \
+                == str(self.pi)
+        except Exception:
+            on_pi = False
+        if on_pi and self.pi.auto.get():
+            self.pi_refresh()
+
+    def pi_power(self, verb):
+        if not self.link:
+            return
+        self._say(f"Pi {verb} requested", "dim")
+        self.link.send((verb.upper() + "\n").encode())
+        if verb in ("reboot", "poweroff"):
+            # The link will drop; show it and stop driving the port.
+            self.root.after(2500, lambda: self._say(
+                f"Pi is {'rebooting' if verb == 'reboot' else 'shutting down'}; "
+                "the link will drop.", "dim"))
+
+    def pi_update(self, names):
+        """Push each named pi/<file> to the Pi with UPDATE, then RESTART and
+        re-query DIAG to confirm. Runs on the Tk thread: link.send is async."""
+        if not self.link:
+            return
+        import hashlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        pidir = os.path.join(os.path.dirname(here), "pi")
+        sent = 0
+        for name in names:
+            try:
+                data = open(os.path.join(pidir, name), "rb").read()
+            except Exception as e:
+                self._say(f"skip {name}: {e}", "err")
+                continue
+            sha = hashlib.sha256(data).hexdigest()
+            self._say(f"pushing {name} ({len(data)} B)…", "dim")
+            self.link.send(f"UPDATE {name} {len(data)} {sha}\n".encode(),
+                           0.1, data)
+            sent += 1
+        if not sent:
+            return
+        # Restart so a new supervisor.py takes effect, then verify.
+        self.link.send(b"RESTART\n")
+        self._say("restarting Pi service; re-checking in ~8 s…", "dim")
+        self.root.after(8000, self.pi_refresh)
+
     def _stop_proxy(self):
         proc = self.proxy
         if not proc:
@@ -930,6 +1032,8 @@ class App:
             self.browser.apply_colors(c)
         if hasattr(self, "payload"):
             self.payload.apply_colors(c)
+        if hasattr(self, "pi"):
+            self.pi.apply_colors(c)
 
     # -- notifications --------------------------------------------
     def notify(self, title, body):
@@ -1012,7 +1116,16 @@ class App:
                     # "stop" makes the tunnel stop the bridge itself after
                     # leaving tunnel mode, while it still owns the port.
                     clean = end_child(proc, "stop" if stop else "quit", 15)
-                    if not clean and stop and dev:
+                    # If the tunnel was already being stopped with "quit" (the
+                    # user hit Stop, then closed before it finished), our
+                    # "stop" lands on a dying process and the bridge would be
+                    # left up. So once the child is gone, stop the bridge
+                    # ourselves over the reopened port -- idempotent: it checks
+                    # the mode first and does nothing if the Pi is already idle.
+                    if stop and dev and is_pi:
+                        time.sleep(0.8)
+                        self._stop_bridge_on(dev)
+                    elif not clean and stop and dev:
                         time.sleep(0.8)
                         self._stop_bridge_on(dev)
                 elif link:
@@ -1065,7 +1178,25 @@ def _single_instance():
     return s
 
 
+def _run_tunnel_child():
+    """Frozen-exe only: when started as `civswitch.exe --run-tunnel <kind> …`,
+    act as the tunnel process instead of the GUI. The remaining args are the
+    tunnel's own, so hand them over untouched."""
+    kind = sys.argv[2]
+    del sys.argv[1:3]   # drop "--run-tunnel kind"; leave the tunnel's own args
+    if kind == "socks":
+        import socks_tunnel
+        socks_tunnel.main()
+    else:
+        import tcp_proxy
+        tcp_proxy.main()
+
+
 def main():
+    if FROZEN and len(sys.argv) > 2 and sys.argv[1] == "--run-tunnel":
+        _run_tunnel_child()
+        return
+
     try:
         diag = open(LOG_FILE, "a", encoding="utf-8")
         faulthandler.enable(file=diag)

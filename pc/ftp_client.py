@@ -177,16 +177,18 @@ class Ftp:
         if path:
             self.cwd(path)
         data = self._pasv()
-        self._send("LIST")
-        self._expect((125, 150))
-        raw = b""
         try:
+            self._send("LIST")
+            self._expect((125, 150))
+            raw = b""
             while True:
                 chunk = data.recv(8192)
                 if not chunk:
                     break
                 raw += chunk
         finally:
+            # Close even if the server rejects LIST (e.g. 550): otherwise the
+            # PASV socket -- and its tunnel channel and Pi-side thread -- leak.
             data.close()
         self._expect((226, 250))
         return [e for e in (self._parse_entry(l)

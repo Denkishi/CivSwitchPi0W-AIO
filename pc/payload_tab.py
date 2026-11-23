@@ -11,12 +11,16 @@ this file.
 
 import json
 import os
+import sys
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STORE = os.path.join(HERE, "civswitch_payloads.json")
+# Next to the .exe when frozen (where __file__ is a temp dir), else pc/.
+_APPDIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else HERE
+STORE = os.path.join(_APPDIR, "civswitch_payloads.json")
 
 SAMPLE = [
     {"name": "Hello (print)", "body": "// Minimal check the loader is alive\n"

@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 build/
+dist/
+*.bak
 # Never commit console keys or payloads: this repo carries neither.
 prod.keys
 *.uf2

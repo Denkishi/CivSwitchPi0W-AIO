@@ -10,6 +10,9 @@ Serial protocol (115200 baud, UTF-8):
   SEND ip port len  → (bridge mode) relay payload to Switch, then END
   STATUS            → AP client count, then END
   SCAN              → client MACs, then END
+  DIAG              → JSON health blob (temp, load, mem, disk, clients), END
+  UPDATE n len sha  → receive len bytes, verify, replace pi/<n>, then END
+  POWEROFF/REBOOT/RESTART → ack, then do it ~1.5s later
 """
 
 import json
@@ -206,6 +209,185 @@ class Supervisor:
             return macs
         except Exception:
             return []
+
+    # ── Diagnostics ──────────────────────────────────────────────
+    def get_diag(self):
+        """A health snapshot for the GUI's Pi tab. Never raises: every probe
+        is best-effort and missing values come back as None so one broken
+        sensor can't blank the whole panel."""
+        d = {"mode": self.mode, "ts": int(time.time())}
+        # CPU temperature (°C)
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                d["temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
+        except Exception:
+            d["temp_c"] = None
+        # Load averages
+        try:
+            d["load"] = [round(x, 2) for x in os.getloadavg()]
+        except Exception:
+            d["load"] = None
+        # Uptime (seconds)
+        try:
+            with open("/proc/uptime") as f:
+                d["uptime_s"] = int(float(f.read().split()[0]))
+        except Exception:
+            d["uptime_s"] = None
+        # Memory (MiB)
+        try:
+            mem = {}
+            with open("/proc/meminfo") as f:
+                for ln in f:
+                    k, _, rest = ln.partition(":")
+                    mem[k] = int(rest.strip().split()[0])  # kB
+            total = mem.get("MemTotal", 0)
+            avail = mem.get("MemAvailable", 0)
+            d["mem_total_mb"] = round(total / 1024)
+            d["mem_used_mb"] = round((total - avail) / 1024)
+        except Exception:
+            d["mem_total_mb"] = d["mem_used_mb"] = None
+        # Disk free on root (MiB)
+        try:
+            st = os.statvfs("/")
+            d["disk_total_mb"] = round(st.f_blocks * st.f_frsize / 1048576)
+            d["disk_free_mb"] = round(st.f_bavail * st.f_frsize / 1048576)
+        except Exception:
+            d["disk_total_mb"] = d["disk_free_mb"] = None
+        # Throttling flags from the VideoCore (undervoltage etc.)
+        try:
+            out = subprocess.check_output(
+                ["vcgencmd", "get_throttled"], timeout=3, text=True,
+                stderr=subprocess.DEVNULL)
+            d["throttled"] = out.strip().split("=", 1)[-1]
+        except Exception:
+            d["throttled"] = None
+        # Wi-Fi clients with signal (bridge mode only)
+        d["clients"] = self._get_client_signals()
+        d["lan_ip"] = self._get_lan_ip()
+        d["ap_ip"] = AP_IP if self.mode == "bridge" else None
+        try:
+            d["hostname"] = os.uname().nodename
+        except Exception:
+            import socket as _s
+            d["hostname"] = _s.gethostname()
+        d["files"] = self._file_versions()
+        return d
+
+    def _get_client_signals(self):
+        """[{mac, signal_dbm}] for stations on the AP, or []."""
+        if self.mode != "bridge":
+            return []
+        try:
+            out = subprocess.check_output(
+                ["iw", "dev", "wlan0", "station", "dump"],
+                timeout=3, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            return []
+        clients, cur = [], None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Station "):
+                cur = {"mac": line.split()[1], "signal_dbm": None}
+                clients.append(cur)
+            elif cur is not None and line.startswith("signal:"):
+                try:
+                    cur["signal_dbm"] = int(line.split()[1])
+                except Exception:
+                    pass
+        return clients
+
+    # Only these may be replaced over the wire, and only inside our own dir.
+    UPDATABLE = ("supervisor.py", "tunnel.py", "bridge_mode.py")
+
+    def _file_versions(self):
+        """sha256 (first 12 hex) + size for each updatable file, so the GUI
+        can tell at a glance which Pi files differ from the ones it ships."""
+        import hashlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = {}
+        for name in self.UPDATABLE:
+            path = os.path.join(here, name)
+            try:
+                data = open(path, "rb").read()
+                out[name] = {"sha": hashlib.sha256(data).hexdigest()[:12],
+                             "size": len(data)}
+            except Exception:
+                out[name] = None
+        return out
+
+    def apply_update(self, name, length, want_sha):
+        """Receive `length` payload bytes, verify sha256, syntax-check, then
+        replace pi/<name> atomically keeping a .bak. Whitelisted names only;
+        the new supervisor takes effect on the next RESTART."""
+        import hashlib
+        if name not in self.UPDATABLE:
+            self.read_exact(length)  # drain so the stream stays aligned
+            self.write(f"ERR name not updatable: {name}")
+            self.write_end()
+            return
+        data = self.read_exact(length)
+        if len(data) < length:
+            self.write(f"ERR short upload {len(data)}/{length}")
+            self.write_end()
+            return
+        got_sha = hashlib.sha256(data).hexdigest()
+        if want_sha and got_sha != want_sha:
+            self.write(f"ERR sha mismatch {got_sha[:12]}")
+            self.write_end()
+            return
+        if name.endswith(".py"):
+            import py_compile
+            here = os.path.dirname(os.path.abspath(__file__))
+            tmp = os.path.join(here, f".{name}.incoming")
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                py_compile.compile(tmp, doraise=True)
+            except Exception as e:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                self.write(f"ERR syntax check failed: {e}")
+                self.write_end()
+                return
+            dest = os.path.join(here, name)
+            try:
+                if os.path.exists(dest):
+                    bak = dest + ".bak"
+                    try:
+                        os.replace(dest, bak)
+                    except Exception:
+                        pass
+                os.replace(tmp, dest)
+                os.chmod(dest, 0o755)
+            except Exception as e:
+                self.write(f"ERR write failed: {e}")
+                self.write_end()
+                return
+        else:
+            self.write("ERR only .py updates supported")
+            self.write_end()
+            return
+        log(f"updated {name} ({length}B, sha {got_sha[:12]})")
+        self.write(f"OK updated {name} sha {got_sha[:12]}")
+        self.write_end()
+
+    def deferred_system(self, action):
+        """Reply first, then poweroff/reboot/restart after the reply has had
+        time to reach the PC. Done off-thread so the serial loop isn't held."""
+        def go():
+            time.sleep(1.5)
+            if action == "poweroff":
+                subprocess.run(["systemctl", "poweroff"], check=False)
+            elif action == "reboot":
+                subprocess.run(["systemctl", "reboot"], check=False)
+            elif action == "restart":
+                # The unit is Restart=on-failure; --no-block returns at once
+                # and systemd re-execs us, picking up any updated supervisor.
+                subprocess.run(["systemctl", "restart", "--no-block",
+                                "civswitch"], check=False)
+        threading.Thread(target=go, daemon=True).start()
 
     # ── Bridge mode ──────────────────────────────────────────────
     def start_bridge(self):
@@ -467,6 +649,33 @@ class Supervisor:
                     self.write_end()
                     continue
                 self.relay_payload(ip, port, length)
+
+            elif line == "DIAG":
+                self.write(json.dumps(self.get_diag()))
+                self.write_end()
+
+            elif line.startswith("UPDATE "):
+                parts = line.split()
+                if len(parts) not in (3, 4):
+                    self.write("ERR usage: UPDATE <name> <len> [sha256]")
+                    self.write_end()
+                    continue
+                name = parts[1]
+                try:
+                    length = int(parts[2])
+                except ValueError:
+                    self.write("ERR invalid length")
+                    self.write_end()
+                    continue
+                want_sha = parts[3] if len(parts) == 4 else ""
+                self.apply_update(name, length, want_sha)
+
+            elif line in ("POWEROFF", "REBOOT", "RESTART"):
+                verb = {"POWEROFF": "poweroff", "REBOOT": "reboot",
+                        "RESTART": "restart"}[line]
+                self.write(f"[SUPERVISOR] {verb} in 1.5s")
+                self.write_end()
+                self.deferred_system(verb)
 
             elif line == "STATUS":
                 count = self._get_client_count()
