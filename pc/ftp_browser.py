@@ -1866,19 +1866,40 @@ class FileBrowser(ttk.Frame):
             self.last_local = os.path.dirname(path)
             self._upload([path])
 
+    def _find_clashes(self, ftp, puts):
+        """Names of planned files that already exist as files on the console."""
+        cache, clashes = {}, []
+        for _kind, remote, _local, _size in puts:
+            parent, _, name = remote.rpartition("/")
+            parent = parent or "/"
+            if parent not in cache:
+                try:
+                    cache[parent] = {e.name: e.is_dir for e in ftp.listdir(parent)}
+                except FtpError:
+                    cache[parent] = {}      # folder does not exist yet
+            if cache[parent].get(name) is False:
+                clashes.append(name)
+        return clashes
+
+    def _ask_from_worker(self, title, msg):
+        """Yes/no dialog on the Tk thread, waited for from a worker thread."""
+        box, done = {}, threading.Event()
+
+        def ask():
+            box["yes"] = messagebox.askyesno(title, msg, parent=self)
+            done.set()
+        self._ui(ask)
+        while not done.wait(0.5):
+            if self.cancel_evt.is_set():
+                return False
+        return box.get("yes", False)
+
     def _upload(self, paths, dest=None):
         paths = [os.path.normpath(p) for p in paths if os.path.exists(p)]
         if not paths:
             return
         dest = dest or self.cwd
         names = [os.path.basename(p) for p in paths]
-        if dest == self.cwd:
-            clash = [n for n in names
-                     if n in self.entries and not self.entries[n].is_dir]
-            if clash and not messagebox.askyesno(
-                    "Overwrite?", f"{len(clash)} file(s) already exist on the "
-                    f"console, e.g. '{clash[0]}'. Overwrite them?", parent=self):
-                return
         label = f"upload of {names[0]}" if len(names) == 1 \
             else f"upload of {len(names)} items"
         self._say(f"uploading {', '.join(names)} → {dest}", "dim")
@@ -1902,6 +1923,14 @@ class FileBrowser(ttk.Frame):
                 else:
                     plan.append(("put", r, p, os.path.getsize(p)))
             puts = [x for x in plan if x[0] == "put"]
+            # Checked for every destination, not only the folder on screen.
+            clashes = self._find_clashes(ftp, puts)
+            if clashes and not self._ask_from_worker(
+                    "Overwrite?", f"{len(clashes)} file(s) already exist on the "
+                    f"console, e.g. '{clashes[0]}'. Overwrite them?"):
+                self._ui(self._say, "upload cancelled, nothing sent", "dim")
+                return
+            bad = []
             idx = unconfirmed = 0
             for kind, remote, local, size in plan:
                 if self.cancel_evt.is_set():
@@ -1919,6 +1948,10 @@ class FileBrowser(ttk.Frame):
                     ftp.store(fh, remote, progress=tick)
                 if not ftp.confirmed:
                     unconfirmed += 1
+                # Read the size back: catches a truncated or partial write.
+                got = ftp.size(remote)
+                if got is not None and got != size:
+                    bad.append(os.path.basename(local))
             total = sum(x[3] for x in puts)
             self._ui(self.xfer_l.config,
                      {"text": f"Uploaded {len(puts)} file(s), {human(total)}"})
@@ -1928,6 +1961,9 @@ class FileBrowser(ttk.Frame):
                 self._ui(self._say, f"{unconfirmed} upload(s) were not confirmed by "
                          "the console -- check the sizes. Copy the updated "
                          "pi/tunnel.py to the Pi to fix this.", "err")
+            if bad:
+                self._ui(self._say, f"SIZE MISMATCH on {len(bad)} file(s): "
+                         f"{', '.join(bad[:5])}. Upload them again.", "err")
             self._ui(self._side_refresh, dest)
             self._ui(self._after_change, dest, names)
         self._queue_transfer(label, work)
